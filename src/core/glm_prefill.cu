@@ -17,6 +17,7 @@
 // routing also feeds the expert tiers' LFU counts, so the decode that follows starts from this conversation's
 // experts.  STRATA_GLM_NO_PREFILL=1 keeps the token-at-a-time prompt (A/B).
 #include "glm_fast_state.hpp"
+#include "glm_ablate.cuh"
 
 #include "strata/core/progress.hpp"
 #include "strata/kernels/cpu/kq_avx512.hpp"
@@ -171,22 +172,24 @@ struct DsaBufs {
     uint16_t *qr16, *attn16;
     int *cells, *n_sel;
     int score_ld;
+    int score_rows;   // rows the score buffer holds (glm-dsa: a tile - its keys are every position, not pools)
 };
 DsaBufs carve_dsa(Carve& c, size_t T, const Glm5Geometry& g, int max_pools) {
     DsaBufs b{};
     b.qr_raw = c.take<float>(T * g.q_lora);
     b.qr = c.take<float>(T * g.q_lora);
     b.qr16 = c.take<uint16_t>(T * g.q_lora);
-    b.kv_raw = c.take<float>(T * g.kv_lora);
+    b.kv_raw = c.take<float>(T * g.lat_row());
     b.ik_raw = c.take<float>(T * g.idx_key);
     b.ig_raw = c.take<float>(T * g.idx_key);
     b.iw = c.take<float>(T * g.idx_heads);
-    b.q = c.take<float>(T * (size_t) g.n_head * g.qk_nope);
+    b.q = c.take<float>(T * (size_t) g.n_head * (g.qk_nope + g.qk_rope));
     b.iq = c.take<float>(T * (size_t) g.idx_heads * g.idx_key);
     b.cells = c.take<int>(T * (size_t) g.n_sel_max());
     b.n_sel = c.take<int>(T);
     b.score_ld = std::max(1, max_pools);
-    b.score = c.take<float>(T * (size_t) b.score_ld);
+    b.score_rows = g.arch == Glm5Geometry::Glm5Arch::Dsa ? (int) std::min<size_t>(T, 64) : (int) T;
+    b.score = c.take<float>((size_t) b.score_rows * b.score_ld);
     b.q_abs = c.take<float>(T * (size_t) g.n_head * g.kv_lora);
     b.ctx = c.take<float>(T * (size_t) g.n_head * g.kv_lora);
     b.attn = c.take<float>(T * (size_t) g.n_head * g.v_head);
@@ -303,6 +306,11 @@ void blas_ck(cublasStatus_t st, const char* what) {
 }  // namespace
 
 struct Glm5Model::PrefillState {
+    // glm-dsa: the chunk's selection of the last full-indexer layer (rows of n_sel_max cells, and their counts), which
+    // the shared layers after it reuse sub-batch for sub-batch
+    int* cells53 = nullptr;
+    int* nsel53 = nullptr;
+    int cells53_rows = 0;
     int T = 0;                       // tokens per chunk
     // --prefill: the chunk and its prestage slots for a lend cap (% of the pool's slots), the cap it was sized with,
     // whether the measured pinned share may still lower it (prefill_settle), and how it reads in the log
@@ -561,7 +569,7 @@ bool Glm5Model::prefill_setup(std::string& err) {
         } else {
             has_dsa = true;
             deq_ok(Ly.q_a, "attn_q_a", il);
-            if (Ly.idx_q_b == nullptr) deq_ok(Ly.idx_q_b_x, "indexer.attn_q_b", il);
+            if (Ly.idx_q_b == nullptr && Ly.idx_k != nullptr) deq_ok(Ly.idx_q_b_x, "indexer.attn_q_b", il);   // (glm-dsa: a shared layer has none)
             deq_ok(Ly.q_b, "attn_q_b", il);
             deq_ok(Ly.kv_a, "attn_kv_a", il);
         }
@@ -587,7 +595,9 @@ bool Glm5Model::prefill_setup(std::string& err) {
                      why.substr(0, 400).c_str());
         return true;
     }
-    if (has_dsa && (g.kv_lora != 512 || g.n_head % 16 != 0 || g.kda_head_dim != 128)) {
+    const bool dsa53 = g.arch == Glm5Geometry::Glm5Arch::Dsa;   // (glm-dsa: mla53_attn takes any head count)
+    if (has_dsa && (dsa53 ? (g.kv_lora > 512 || g.kv_lora % 32 != 0 || g.qk_rope > 64)
+                          : (g.kv_lora != 512 || g.n_head % 16 != 0 || g.kda_head_dim != 128))) {
         std::fprintf(stderr, "glm prefill: geometry not covered by the batched kernels - token by token\n");
         return true;
     }
@@ -1260,6 +1270,8 @@ void Glm5Model::prefill_destroy() {
     PrefillState* S = pf_;
     if (S == nullptr) return;
     cudaSetDevice(dev_);
+    if (S->cells53 != nullptr) cudaFree(S->cells53);
+    if (S->nsel53 != nullptr) cudaFree(S->nsel53);
     if (fast_ && fast_->cs) cudaStreamSynchronize(fast_->cs);
     if (fast_ && fast_->copy) cudaStreamSynchronize(fast_->copy);
     if (S->prof && !S->pacc.empty()) {
@@ -1390,6 +1402,11 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
     // the mHC read half for the whole chunk: (write half of the previous block,) mix dots, gates, x / x16
     const auto hc_read = [&](const float* block_out, const uint16_t* fn, const float* scale, const float* base,
                              const float* norm) {
+        if (!g.mhc) {   // glm-dsa: R += the block's rows, then the norm (one stream)
+            if (block_out != nullptr) gb::add_rows(S->R, block_out, (long long) T * E, s);
+            gb::rms_rows(S->R, norm, g.norm_eps, T, E, S->x, S->x16, s);
+            return;
+        }
         gb::hc_update(block_out, S->R, S->post, S->comb, S->ss, T, E, s);
         sgemm_bf16(fn, 24, 4 * E, S->R, 4 * E, S->mix, 24, T, 1.0f);
         gb::HcFinishArgs h;
@@ -1412,6 +1429,20 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
         gb::hc_finish(h, s);
     };
 
+    if (g.arch == Glm5Geometry::Glm5Arch::Dsa && S->cells53_rows < T) {
+        if (S->cells53 != nullptr) cudaFree(S->cells53);
+        if (S->nsel53 != nullptr) cudaFree(S->nsel53);
+        S->cells53 = nullptr;
+        S->nsel53 = nullptr;
+        S->cells53_rows = 0;
+        if (cudaMalloc(&S->cells53, (size_t) T * g.n_sel_max() * sizeof(int)) != cudaSuccess ||
+            cudaMalloc(&S->nsel53, (size_t) T * sizeof(int)) != cudaSuccess) {
+            cudaGetLastError();
+            err = "glm prefill: the glm-dsa selection buffer did not allocate";
+            return false;
+        }
+        S->cells53_rows = T;
+    }
     // GLM_CB_DIR seam dumps of the chunk's LAST row, under the token path's names (debug only, synchronous)
     static const char* cb_dir = getenv("GLM_CB_DIR");
     // A single-device prompt chunk only conditions later tokens; decode computes the last prompt token and its
@@ -1715,7 +1746,12 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
         const auto& Ly = F->L[(size_t) il];
         const bool skip_output = tail_skip && il == g.n_layers - 1;
         if (S->trace) cudaEventRecord(S->tr[(size_t) il].start, s);
+        if (!g.mhc && il != l0_) {   // STRATA_GLM_ABLATE per layer: both operands of layer il-1's FFN write
+            glm_ablate::layer_rows(il - 1, S->ffn, T, E, s);
+            glm_ablate::layer_rows(il - 1, S->R, T, E, s);
+        }
         hc_read(il == l0_ ? nullptr : S->ffn, Ly.hc_attn_fn, Ly.hc_attn_scale, Ly.hc_attn_base, Ly.attn_norm);
+        if (!g.mhc && il != l0_) glm_ablate::capture(il - 1, S->R, T, E, s);   // residual after layer il-1's FFN
         S->mark("hc", s);
         // S->R: the layer's input rows - the DFlash drafter's features when it reads this layer (the stream means go
         // out through S->mixer, which this layer's mixer writes only after)
@@ -1767,6 +1803,90 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                             state_ + kda_S_[(size_t) il], B.g2, Ly.ssm_norm, g.norm_eps, g.n_head, tn, B.out16, s);
                 S->mark("kda_rec", s);
                 if (!skip_output) hgemm_q(Ly.out, E, DI, B.out16, DI, mixer, E, tn, 0.0f);
+            } else if (g.arch == Glm5Geometry::Glm5Arch::Dsa) {
+                // glm-dsa (docs/GLM53-ENGINE-PORT.md P4): fast_dsa53 for a sub-batch of rows
+                Carve c{S->uni};
+                DsaBufs B = carve_dsa(c, (size_t) tn, g, S->max_pools);
+                const int pt = (int) (p0 + t0);
+                const bool own = Ly.idx_k != nullptr;
+                const int qs = g.qk_nope + g.qk_rope, LR = g.lat_row(), NS = g.n_sel_max();
+                const float prescale = 1.0f / std::sqrt((float) (g.idx_key * g.idx_heads));
+                hgemm_q(Ly.q_a, g.q_lora, E, x16, E, B.qr_raw, g.q_lora, tn, 0.0f);
+                hgemm_q(Ly.kv_a, LR, E, x16, E, B.kv_raw, LR, tn, 0.0f);
+                if (own) {
+                    sgemm_bf16(Ly.idx_k, g.idx_key, E, xs, E, B.ik_raw, g.idx_key, tn, 1.0f);
+                    sgemm_bf16(Ly.idx_proj, g.idx_heads, E, xs, E, B.iw, g.idx_heads, tn, prescale);
+                }
+                gb::Dsa53PrepArgs d;
+                d.qr_raw = B.qr_raw;
+                d.q_a_norm = Ly.q_a_norm;
+                d.qr = B.qr;
+                d.qr16 = B.qr16;
+                d.q_lora = g.q_lora;
+                d.kv_raw = B.kv_raw;
+                d.kv_norm = Ly.kv_a_norm;
+                d.lat = lat;
+                d.kv_lora = g.kv_lora;
+                d.qk_rope = g.qk_rope;
+                d.ik_raw = own ? B.ik_raw : nullptr;
+                d.k_norm_w = Ly.k_norm_w;
+                d.k_norm_b = Ly.k_norm_b;
+                d.ik_cache = own ? state_ + dsa_ik_[(size_t) il] : nullptr;
+                d.idx_key = g.idx_key;
+                d.p0 = pt;
+                d.T = tn;
+                d.eps = g.norm_eps;
+                d.rope_base = g.rope_base;
+                gb::dsa53_prep(d, s);
+                hgemm_q(Ly.q_b, g.n_head * qs, g.q_lora, B.qr16, g.q_lora, B.q, g.n_head * qs, tn, 0.0f);
+                gb::rope_rows(B.q, tn, g.n_head, qs, g.n_head * qs, g.qk_nope, g.qk_rope, pt, g.rope_base, s);
+                S->mark("dsa_proj", s);
+                int* cells = S->cells53 + (size_t) t0 * NS;
+                int* nsel = S->nsel53 + t0;
+                if (own) {
+                    if (Ly.idx_q_b_x.q != nullptr)
+                        hgemm_q(Ly.idx_q_b_x, g.idx_heads * g.idx_key, g.q_lora, B.qr16, g.q_lora, B.iq,
+                                g.idx_heads * g.idx_key, tn, 0.0f);
+                    else
+                        sgemm_bf16(Ly.idx_q_b, g.idx_heads * g.idx_key, g.q_lora, B.qr, g.q_lora, B.iq,
+                                   g.idx_heads * g.idx_key, tn, 1.0f);
+                    gb::rope_rows(B.iq, tn, g.idx_heads, g.idx_key, g.idx_heads * g.idx_key, 0, g.qk_rope, pt,
+                                  g.rope_base, s);
+                    // every key so far is a one-token pool (kpool 1); the scores in tiles of rows the buffer holds
+                    for (int r0 = 0; r0 < tn; r0 += B.score_rows) {
+                        const int rn = std::min(B.score_rows, tn - r0);
+                        const int vis = pt + r0 + rn;
+                        if (vis > g.idx_top_k)
+                            gb::dsa_score(B.iq + (size_t) r0 * g.idx_heads * g.idx_key, state_ + dsa_ik_[(size_t) il],
+                                          B.iw + (size_t) r0 * g.idx_heads, g.idx_key, g.idx_heads, pt + r0, 1, rn, vis,
+                                          B.score, B.score_ld, s);
+                        gb::dsa_select(B.score, B.score_ld, pt + r0, 1, g.idx_top_k, 0, rn, NS, cells + (size_t) r0 * NS,
+                                       nsel + r0, s);
+                    }
+                    S->mark("dsa_index", s);
+                }   // (a shared layer: cells / nsel hold this sub-batch's rows from the last full layer)
+                gb::bf16_to_f32(Ly.k_b, S->w32, (int64_t) g.n_head * g.kv_lora * g.qk_nope, s);
+                blas_ck(cublasSgemmStridedBatched(S->blas, CUBLAS_OP_T, CUBLAS_OP_N, g.kv_lora, tn, g.qk_nope, &one,
+                                                  S->w32, g.qk_nope, (long long) g.kv_lora * g.qk_nope, B.q,
+                                                  g.n_head * qs, qs, &zero, B.q_abs, g.n_head * g.kv_lora, g.kv_lora,
+                                                  g.n_head),
+                        "q_abs");
+                S->mark("dsa_qabs", s);
+                if (!gb::mla53_attn(B.q_abs, B.q, lat, cells, nsel, NS, g.n_head, g.qk_nope, g.qk_rope, g.kv_lora,
+                                    1.0f / std::sqrt((float) qs), tn, B.ctx, s)) {
+                    err = "glm prefill: the glm-dsa attention kernel cannot run this shape";
+                    return false;
+                }
+                S->mark("dsa_attn", s);
+                gb::bf16_to_f32(Ly.v_b, S->w32, (int64_t) g.n_head * g.v_head * g.kv_lora, s);
+                blas_ck(cublasSgemmStridedBatched(S->blas, CUBLAS_OP_T, CUBLAS_OP_N, g.v_head, tn, g.kv_lora, &one,
+                                                  S->w32, g.kv_lora, (long long) g.v_head * g.kv_lora, B.ctx,
+                                                  g.n_head * g.kv_lora, g.kv_lora, &zero, B.attn, g.n_head * g.v_head,
+                                                  g.v_head, g.n_head),
+                        "mla out");
+                gb::f32_to_f16(B.attn, B.attn16, (int64_t) tn * g.n_head * g.v_head, s);
+                if (!skip_output)
+                    hgemm_q(Ly.out, E, g.n_head * g.v_head, B.attn16, g.n_head * g.v_head, mixer, E, tn, 0.0f);
             } else {
                 Carve c{S->uni};
                 DsaBufs B = carve_dsa(c, (size_t) tn, g, S->max_pools);
@@ -2474,8 +2594,8 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
             if (Ly.exl3) run_set_x3(wbase, n_exp, stride, d_bounds, hb, r0);
             else run_set(wbase, n_exp, stride, d_bounds, hb, r0);
         };
-        if (2 * nff != E) {
-            err = "glm prefill: 2 * n_ff_exp != n_embd (the gate/up rows would not fit the set's output rows)";
+        if (2 * nff > E) {   // (glm-dsa: 2 x 2048 < 6144 - the packed gate/up rows take part of the set's rows)
+            err = "glm prefill: 2 * n_ff_exp > n_embd (the gate/up rows would not fit the set's output rows)";
             return false;
         }
         // the disk-only experts (staged last, ascending): their indices in the reader's order - inside the segment
@@ -2854,7 +2974,14 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
     }
     // the last layer's write half: R = post x ffn + comb . R
     if (!tail_skip) {
-        gb::hc_update(S->ffn, S->R, S->post, S->comb, nullptr, T, E, s);
+        if (g.mhc)
+            gb::hc_update(S->ffn, S->R, S->post, S->comb, nullptr, T, E, s);
+        else {
+            glm_ablate::layer_rows(l1_ - 1, S->ffn, T, E, s);   // STRATA_GLM_ABLATE per layer: the last layer's FFN write
+            glm_ablate::layer_rows(l1_ - 1, S->R, T, E, s);
+            gb::add_rows(S->R, S->ffn, (long long) T * E, s);
+            glm_ablate::capture(l1_ - 1, S->R, T, E, s);
+        }
         S->mark("hc", s);
     }
     // ---- the NextN block's caches for these positions (the half that carries it): position p reads h_p and the
@@ -2878,6 +3005,43 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                     std::memcpy(S->emb_h + (size_t) t * E, next_img[t], (size_t) E * sizeof(float));
                 else
                     tt->to_float(pack_emb_src_ + (size_t) next_ids[t] * row_b, S->emb_h + (size_t) t * E, E);
+            }
+            if (g.arch == Glm5Geometry::Glm5Arch::Dsa) {
+                // glm-dsa: rms(R) is the head's input (one stream), the cache row [latent | rotated k_rope] and the
+                // rotated indexer key - the NextN block's own indexer is a full one
+                Carve c{S->uni};
+                float* h = c.take<float>((size_t) Tv * E);
+                float* emb = c.take<float>((size_t) Tv * E);
+                uint16_t* cat16 = c.take<uint16_t>((size_t) Tv * 2 * E);
+                float* hid = c.take<float>((size_t) Tv * E);
+                float* kv = c.take<float>((size_t) Tv * g.lat_row());
+                float* ik = c.take<float>((size_t) Tv * g.idx_key);
+                cudaMemcpyAsync(emb, S->emb_h, (size_t) Tv * E * sizeof(float), cudaMemcpyHostToDevice, s);
+                gb::rms_rows(S->R, w_.at("output_norm.weight"), g.norm_eps, Tv, E, h, S->x16, s);
+                gb::mtp_in_rows(emb, h, Ly.enorm, Ly.hnorm, g.norm_eps, Tv, E, cat16, s);
+                hgemm_q(Ly.eh, E, 2 * E, cat16, 2 * E, hid, E, Tv, 0.0f);
+                gb::rms_rows(hid, Ly.attn_norm, g.norm_eps, Tv, E, S->x, S->x16, s);
+                hgemm_q(Ly.kv_a, g.lat_row(), E, S->x16, E, kv, g.lat_row(), Tv, 0.0f);
+                sgemm_bf16(Ly.idx_k, g.idx_key, E, S->x, E, ik, g.idx_key, Tv, 1.0f);
+                gb::Dsa53PrepArgs d;
+                d.kv_raw = kv;
+                d.kv_norm = Ly.kv_a_norm;
+                d.lat = (uint16_t*) (state_ + dsa_lat_[(size_t) mtp_il_]);
+                d.kv_lora = g.kv_lora;
+                d.qk_rope = g.qk_rope;
+                d.ik_raw = ik;
+                d.k_norm_w = Ly.k_norm_w;
+                d.k_norm_b = Ly.k_norm_b;
+                d.ik_cache = state_ + dsa_ik_[(size_t) mtp_il_];
+                d.idx_key = g.idx_key;
+                d.p0 = (int) p0;
+                d.T = Tv;
+                d.eps = g.norm_eps;
+                d.rope_base = g.rope_base;
+                gb::dsa53_prep(d, s);
+                S->mark("mtp_cache", s);
+                S->collect();
+                return glmfast::cuda_ok(cudaGetLastError(), "glm prefill", err);
             }
             Carve c{S->uni};
             float* h = c.take<float>((size_t) Tv * E);
@@ -3185,7 +3349,7 @@ bool Glm5Model::prefill_run(const std::vector<int32_t>& tokens, std::string& err
         }
         // the embedding lands in x (free until the first layer's gates write it) and fans out to the 4 streams
         cudaMemcpyAsync(S->x, S->emb_h, (size_t) T * E * sizeof(float), cudaMemcpyHostToDevice, fast_->cs);
-        gb::embed_rows(S->x, S->R, T, E, fast_->cs);
+        gb::embed_rows(S->x, S->R, T, E, fast_->cs, g_.hc);
         return true;
     };
     std::vector<Glm5Model*> parts;

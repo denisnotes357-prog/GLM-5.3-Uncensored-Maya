@@ -19,7 +19,7 @@ void f32_to_f16(const float* src, void* dst, int64_t n, cudaStream_t s);
 /// dst[i] = half(src[i]) for BF16 bits (FP16 bits out).
 void bf16_to_f16(const uint16_t* src, void* dst, int64_t n, cudaStream_t s);
 /// R[t][s][e] = emb[t][e] for the 4 streams.
-void embed_rows(const float* emb, float* R, int T, int n_embd, cudaStream_t s);
+void embed_rows(const float* emb, float* R, int T, int n_embd, cudaStream_t s, int hc = 4);   // hc copies a row
 
 /// The mHC write half (in place) and the read half's sum of squares: when block_out != nullptr,
 ///   R[t][d] = post[t][d] * block_out[t] + sum_s comb[t][d][s] * R[t][s];  then ss[t] = sum R[t]^2 (ss may be null).
@@ -83,6 +83,28 @@ struct DsaPrepArgs {
     float eps = 1e-5f;
 };
 void dsa_prep(const DsaPrepArgs& a, cudaStream_t s);
+
+// ---- glm-dsa (the full GLM-5.3, docs/GLM53-ENGINE-PORT.md P4): the prompt path's DSA pieces
+struct Dsa53PrepArgs {
+    const float* qr_raw = nullptr; const float* q_a_norm = nullptr; float* qr = nullptr; void* qr16 = nullptr;
+    int q_lora = 2048;
+    const float* kv_raw = nullptr;   // rows of kv_lora + qk_rope: the latent, then k_rope
+    const float* kv_norm = nullptr; uint16_t* lat = nullptr; int kv_lora = 512, qk_rope = 64;
+    const float* ik_raw = nullptr;   // null: a shared-indexer layer (no key)
+    const float* k_norm_w = nullptr; const float* k_norm_b = nullptr; float* ik_cache = nullptr; int idx_key = 128;
+    int p0 = 0, T = 0;
+    float eps = 1e-5f, rope_base = 10000.0f;
+};
+void dsa53_prep(const Dsa53PrepArgs& a, cudaStream_t s);
+/// RoPE (llama.cpp NORM) at positions p0 + t on n_rot features at `off` of the n_vec vectors (stride apart) of each row.
+void rope_rows(float* x, int T, int n_vec, int stride, int row_stride, int off, int n_rot, long long p0, float base,
+               cudaStream_t s);
+/// R[i] += add[i] for n floats (the plain residual).
+void add_rows(float* R, const float* add, long long n, cudaStream_t s);
+/// The absorbed MLA with the RoPE tail for a chunk of tokens; false when the shape is not covered.
+bool mla53_attn(const float* q_abs, const float* q, const uint16_t* lat, const int* cells, const int* n_sel,
+                int n_sel_max, int n_head, int qk_nope, int qk_rope, int kv_lora, float scale, int T, float* ctx,
+                cudaStream_t s);
 /// The pooled keys of pools [pool0, pool0 + n) (their cells all in the caches, positions modulo ring).
 void dsa_pool(const float* ik_cache, const float* ig_cache, const float* ape, float* pooled, int idx_key, int kpool,
               int pool0, int n, cudaStream_t s, int ring = 1 << 30);
@@ -119,7 +141,7 @@ void head_rows(const float* R, const float* w, float eps, int T, int n_embd, flo
 void mtp_in_rows(const float* emb, const float* h, const float* enorm, const float* hnorm, float eps, int T, int n_embd,
                  void* out16, cudaStream_t s);
 /// x[t] = rms(in[t]) * w as F32 and FP16.  n_embd <= 4096, a multiple of 256.
-void rms_rows(const float* in, const float* w, float eps, int T, int n_embd, float* x, void* x16, cudaStream_t s);
+void rms_rows(const float* in, const float* w, float eps, int T, int n_embd, float* x, void* x16, cudaStream_t s);   // n_embd <= 8192
 
 /// The router per token (router_sigmoid's arithmetic: sigmoid, bias selection, stable top-k, normalised weights).
 void route(const float* logits, const float* bias, int n_expert, int k, float w_scale, bool norm_w, int T, int* ids,

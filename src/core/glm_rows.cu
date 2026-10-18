@@ -247,7 +247,7 @@ bool Glm5Model::multi_rows(const int* seqs, const int32_t* tokens, const strata:
         tt->to_float(pack_emb_src_ + (size_t) tokens[i] * emb_row, c.emb_h, E);
         if (rw[i].img != nullptr) std::memcpy(c.emb_h, rw[i].img, (size_t) E * sizeof(float));
         cudaMemcpyAsync(F->emb, c.emb_h, (size_t) E * sizeof(float), cudaMemcpyHostToDevice, s);
-        gf::embed_streams(F->emb, rw[i].state, E, s);
+        gf::embed_streams(F->emb, rw[i].state, E, s, g.hc);
     }
 
     const auto rows = [&](float* b, int64_t per, int i) { return b + (size_t) i * (size_t) per; };
@@ -380,7 +380,7 @@ bool Glm5Model::multi_rows(const int* seqs, const int32_t* tokens, const strata:
                                   rows(S->iw, g.idx_heads, i), g.idx_key, g.idx_heads, pool_done, F->score, s);
                 const int top_pools = std::min(g.top_pools_max(), pool_done);
                 const int n_sel = g.idx_kpool * top_pools + (g.idx_select_tail ? g.idx_kpool - 1 : 0);
-                gf::dsa_select(F->score, pool_done, g.idx_kpool, top_pools, n_sel, (int) p, F->cells, s);
+                gf::dsa_select(F->score, pool_done, g.idx_kpool, top_pools, n_sel, (int) p, F->cells, s, F->sel_ws);
                 uint16_t* const lat = (uint16_t*) (rw[i].state + (*rw[i].dsa_lat)[(size_t) il]);
                 const int* cells = kv_attend_cells(rw[i].kv, il, lat, F->cells, n_sel, F->slot_cells, s);
                 gf::mla(rows(S->q, (int64_t) g.n_head * g.qk_nope, i), Ly.k_b, Ly.v_b, lat, cells, n_sel, g.n_head,
@@ -438,7 +438,7 @@ bool Glm5Model::multi_rows(const int* seqs, const int32_t* tokens, const strata:
     // ---- the head: one read of the output matrix for every row, then each row's draw
     for (int i = 0; i < n; ++i)
         gf::head_prep(rw[i].state, w_.at("output_norm.weight"), g.norm_eps, E, rows(S->head_x, E, i),
-                      rows_q(S->head_xq, E, i), s);
+                      rows_q(S->head_xq, E, i), s, g.hc);
     const WSlot& ow = ws_map_.at("output.weight");
     gf::MvJob o = {ow.q, S->head_xq, S->head_x, S->logits, nullptr, 1.0f, ow.type, E, g.n_vocab};
     if (ow.type == 0) o.w = ow.f32;

@@ -1877,6 +1877,19 @@ static int glm_pack_generate(const Options& o) {
                              (unsigned long long) (model.mtp_rounds_ - rounds0),
                              (double) n_spec / (double) (model.mtp_rounds_ - rounds0), lens.c_str());
             }
+        } else if (std::strcmp(finish, "cancel") != 0 && model.fast() && model.mtp_pipe_ready() && req_spec != 1) {
+            // the pipelined MTP decode on a split (glm_mtp.cu, STRATA_GLM_MTP_PIPE=1): the NextN block on the last part
+            // drafts a chain, the pipelined window checks it across the parts at once (same tokens as the loop below)
+            int64_t n_spec = 0;
+            const uint64_t rounds0 = model.mtp_rounds_;
+            if (!model.decode_mtp_pipe(sp, max_new, on_token, n_spec, err)) {
+                drop_if_poisoned(prompt, err);
+                std::printf("ERR %s\n", err.c_str());
+                return 1;
+            }
+            if (model.mtp_rounds_ > rounds0)
+                std::fprintf(stderr, "glm mtp pipe: %.2f tokens a drafting round\n",
+                             (double) n_spec / (double) (model.mtp_rounds_ - rounds0));
         } else if (std::strcmp(finish, "cancel") != 0 && model.fast() && model.spec_ready()) {
             // the pipelined speculative decode: the two halves of the split work on consecutive tokens, the head
             // running the NextN block's draft (same tokens as the loop below)
@@ -3824,19 +3837,21 @@ int main(int argc, char** argv) {
         // is the authority on its own MoE shape - everything else in the geometry is unchanged
         try {
             strata::GgufFile model_gguf(o.native_preset);
-            // BOTH spellings in the wild: llama.cpp's canonical "glm5-next" and unsloth's "glm5next"
-            // (docs/GLM5-FLASH.md; Glm5Geometry::from_gguf detects them the same way).
+            // Both Flash spellings (llama.cpp's canonical "glm5-next" and unsloth's "glm5next") and
+            // llama.cpp's "glm-dsa" for the full GLM-5.3: each belongs to the GLM runner, never to
+            // this driver's qwen4exp session/graph machinery (docs/GLM53-ENGINE-PORT.md P1; the same
+            // gate sends them all to --glm-pack, i.e. glm_pack_generate).
             if (const strata::MetaValue* v = model_gguf.get("general.architecture");
                 v != nullptr && v->type == strata::MetaType::STRING &&
-                (v->s == "glm5-next" || v->s == "glm5next")) {
-                // this GGUF belongs to the GLM runner, not the qwen4exp session/graph machinery:
+                (v->s == "glm5-next" || v->s == "glm5next" || v->s == "glm-dsa")) {
                 // point at the pack path instead of dying inside check_all with shape mismatches.
+                const char* label = v->s == "glm-dsa" ? "GLM-5.3" : "GLM-5.3-Flash";
                 std::fprintf(stderr,
-                             "maya generate: %s declares architecture %s (GLM-5.3-Flash)\n"
+                             "maya generate: %s declares architecture %s (%s)\n"
                              "maya generate: the qwen4exp driver path cannot serve it - run the pack instead:\n"
                              "maya generate:   strata generate --glm-pack <pack_dir> --tokens ... (the verified\n"
                              "maya generate:   Glm5Model runner; docs/GLM5-FLASH.md §9)\n",
-                             o.native_preset.c_str(), v->s.c_str());
+                             o.native_preset.c_str(), v->s.c_str(), label);
                 return 2;
             }
             if (const strata::MetaValue* v = model_gguf.get("qwen4exp.expert_count")) g.n_expert = (int64_t) v->u;

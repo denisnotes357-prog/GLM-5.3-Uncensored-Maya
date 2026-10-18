@@ -1,0 +1,43 @@
+{
+ "exe": "build/strata",
+ "args": [
+  "--glm-pack",
+  "models/GLM-5.3-Uncensored-Maya/pack",
+  "--max-context",
+  "512000",
+  "--expert-cache",
+  "auto",
+  "--prefill",
+  "auto"
+ ],
+ "cwd": ".",
+ "tokenizer": "models/GLM-5.3-Uncensored-Maya/pack/tokenizer",
+ "model_name": "glm-5.3",
+ "gpu": [
+  5,
+  0,
+  2,
+  3,
+  4,
+  7,
+  6
+ ],
+ "sampling": {
+  "temperature": 1.0,
+  "top_p": 0.95
+ },
+ "reasoning_effort": "high",
+ "env": {
+  "STRATA_GLM_DSA_DEV": "1",
+  "STRATA_GLM_RAM_RESIDENT": "1",
+  "STRATA_GLM_SPLIT": "10,22,34,46,58,70",
+  "STRATA_GLM_CPU_LANE": "0",
+  "STRATA_GLM_COMPLETE_POOL": "1",
+  "STRATA_GLM_RESIDENT_SKIP": "1",
+  "STRATA_GLM_SPEC_HEAD": "4",
+  "STRATA_GLM_MTP_PIPE": "1",
+  "STRATA_GLM_MTP_DRAFT": "7",
+  "STRATA_GLM_MTP_PIPE_FRESH": "0"
+ },
+ "log": "glm53-server.log"
+}

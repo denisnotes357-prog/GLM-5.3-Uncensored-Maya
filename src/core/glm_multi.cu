@@ -234,7 +234,7 @@ bool Glm5Model::multi_issue(int s, int32_t token, const strata::kernels::Sampler
     if (const float* img = image_row(p)) std::memcpy(c.emb_h, img, (size_t) g.n_embd * sizeof(float));
     cudaSetDevice(dev_);
     cudaMemcpyAsync(F->emb, c.emb_h, (size_t) g.n_embd * sizeof(float), cudaMemcpyHostToDevice, F->cs);
-    gf::embed_streams(F->emb, state_, g.n_embd, F->cs);
+    gf::embed_streams(F->emb, state_, g.n_embd, F->cs, g.hc);
     if (!fast_layers(p, false, err)) return false;
     Glm5Model* tail = this;
     const size_t hop = (size_t) g.hc * g.n_embd * sizeof(float);
@@ -254,7 +254,7 @@ bool Glm5Model::multi_issue(int s, int32_t token, const strata::kernels::Sampler
     SeqCtx& ct = tail->seq_[(size_t) s];
     cudaSetDevice(tail->dev_);
     gf::head_prep(tail->state_, tail->w_.at("output_norm.weight"), g.norm_eps, g.n_embd, FT->head_x, FT->head_xq,
-                  FT->cs);
+                  FT->cs, g.hc);
     const WSlot& ow = tail->ws_map_.at("output.weight");
     gf::MvJob o = {ow.q, FT->head_xq, FT->head_x, tail->sc_ + tail->sc_logits, nullptr, 1.0f, ow.type, g.n_embd,
                    g.n_vocab};

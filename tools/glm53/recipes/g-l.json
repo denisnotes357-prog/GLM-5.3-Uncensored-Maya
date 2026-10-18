@@ -1,0 +1,12 @@
+{"name": "Maya-G-L",
+ "note": "GLM-5.3 (glm-dsa, 78 trunk layers + NextN blk.78) after Maya-L: IQ3_S routed gate/up, IQ4_XS routed down, Q5_K down in the first and last four MoE layers (3-6, 74-77); NextN experts Q4_K/Q5_K; router and its bias F32; indexer projections Q8_0 and its head-weight projection F32 (llama.cpp keeps it F32); everything else 2-D (attention, shared experts, dense FFN, embeddings, output, NextN eh_proj) Q6_K. 1-D tensors and norms stay F32. Rows that are not whole blocks fall back to Q8_0 (or F32).",
+ "rules": [
+  {"match": "^blk\\.78\\.ffn_(gate|up)_exps", "type": "Q4_K"},
+  {"match": "^blk\\.78\\.ffn_down_exps", "type": "Q5_K"},
+  {"match": "ffn_(gate|up)_exps", "type": "IQ3_S"},
+  {"match": "^blk\\.([3-6]|7[4-7])\\.ffn_down_exps", "type": "Q5_K"},
+  {"match": "ffn_down_exps", "type": "IQ4_XS"},
+  {"match": "ffn_gate_inp|exp_probs_b|indexer\\.proj", "type": "F32"},
+  {"match": "indexer\\.", "type": "Q8_0"}
+ ],
+ "default": "Q6_K"}

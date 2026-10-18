@@ -40,6 +40,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace gf = strata::kernels::glmf;
@@ -248,10 +249,24 @@ void Glm5Model::mtp_draft_setup() {
             if (F->L[(size_t) il].moe) experts += F->L[(size_t) il].blob * (size_t) g.n_expert;
         room = free_b > experts + tb + ((size_t) 4 << 30);
     }
-    if (want && room && pack_emb_src_ != nullptr &&
+    // the pipelined MTP decode on a split (decode_mtp_pipe) chains its drafts where the device has no room too:
+    // token_embd in pinned host memory mapped into the device, a draft step reading its one row over PCIe - the chain
+    // is what lets the drafts run while the window's first token crosses the first parts
+    const bool mapped = want && !room && mtp_pipe_;
+    if (want && (room || mapped) && pack_emb_src_ != nullptr &&
         (pack_emb_type_ == GGML_TYPE_Q6_K || pack_emb_type_ == GGML_TYPE_Q8_0) && g.n_embd % 256 == 0) {
-        bool ok = cudaMalloc(&F->mtp_emb, tb) == cudaSuccess &&
-                  cudaMemcpy(F->mtp_emb, pack_emb_src_, tb, cudaMemcpyHostToDevice) == cudaSuccess &&
+        bool ok = false;
+        if (mapped) {
+            ok = cudaHostAlloc(&F->mtp_emb_host, tb, cudaHostAllocMapped | cudaHostAllocPortable) == cudaSuccess;
+            if (ok) {
+                std::memcpy(F->mtp_emb_host, pack_emb_src_, tb);
+                ok = cudaHostGetDevicePointer(&F->mtp_emb, F->mtp_emb_host, 0) == cudaSuccess;
+            }
+        } else {
+            ok = cudaMalloc(&F->mtp_emb, tb) == cudaSuccess &&
+                 cudaMemcpy(F->mtp_emb, pack_emb_src_, tb, cudaMemcpyHostToDevice) == cudaSuccess;
+        }
+        ok = ok &&
                   cudaHostAlloc((void**) &F->mtp_emb_h, (size_t) g.n_embd * sizeof(float), cudaHostAllocDefault) ==
                       cudaSuccess &&
                   cudaEventCreateWithFlags(&F->ev_mtp_emb, cudaEventDisableTiming) == cudaSuccess;
@@ -275,9 +290,11 @@ void Glm5Model::mtp_draft_setup() {
         if (d_row) cudaFree(d_row);
         if (!ok) {
             cudaGetLastError();
-            if (F->mtp_emb) cudaFree(F->mtp_emb);
+            if (F->mtp_emb_host) cudaFreeHost(F->mtp_emb_host);
+            else if (F->mtp_emb) cudaFree(F->mtp_emb);
             if (F->mtp_emb_h) cudaFreeHost(F->mtp_emb_h);
             if (F->ev_mtp_emb) cudaEventDestroy(F->ev_mtp_emb);
+            F->mtp_emb_host = nullptr;
             F->mtp_emb = nullptr;
             F->mtp_emb_h = nullptr;
             F->ev_mtp_emb = nullptr;
@@ -293,7 +310,8 @@ void Glm5Model::mtp_draft_setup() {
     else
         std::fprintf(stderr, "glm mtp: CUDA%d the MTP decode drafts over the whole vocabulary", dev_);
     if (F->mtp_emb)
-        std::fprintf(stderr, ", chained on the device (token_embd there, %.0f MB)\n", (double) tb / 1048576.0);
+        std::fprintf(stderr, ", chained on the device (token_embd %s, %.0f MB)\n",
+                     F->mtp_emb_host != nullptr ? "in pinned host memory mapped there" : "there", (double) tb / 1048576.0);
     else
         std::fprintf(stderr, "\n");
 }
@@ -309,7 +327,7 @@ bool Glm5Model::mtp_cache_setup(std::string& err) {
     const size_t a = 256;
     const auto up = [&](size_t b) { return (b + a - 1) / a * a; };
     const size_t f = sizeof(float);
-    const size_t sz[8] = {up(rows * E * f), up(rows * E * f), up(rows * E * f), up(rows * g.kv_lora * f),
+    const size_t sz[8] = {up(rows * E * f), up(rows * E * f), up(rows * E * f), up(rows * g.lat_row() * f),
                           up(rows * g.idx_key * f), up(rows * g.idx_key * f), up(rows * q8_bytes(2 * E)),
                           up(rows * q8_bytes(E))};
     size_t total = 0;
@@ -393,6 +411,48 @@ bool Glm5Model::mtp_cache_rows(int64_t p0, int n, const float* h, const int32_t*
     for (int i = 0; i < n; ++i)
         gf::rms_q8(C.hid + (size_t) i * E, nullptr, Ly.attn_norm, g.norm_eps, g.n_embd, C.x + (size_t) i * E,
                    (uint8_t*) C.xq + (size_t) i * q8_bytes(E), s);
+    if (g.arch == Glm5Geometry::Glm5Arch::Dsa) {
+        // glm-dsa: the cache row [latent | rotated k_rope] (lat_row floats in) and, the block having its own indexer,
+        // the rotated indexer key - fast_dsa53's dsa53_prep without the query
+        const bool own = Ly.idx_k != nullptr;
+        gf::MvJob k[2];
+        int nk = 0;
+        k[nk++] = {Ly.kv_a.q, C.xq, C.x, C.kv_raw, nullptr, 1.0f, Ly.kv_a.type, g.n_embd, g.lat_row()};
+        if (own) k[nk++] = {Ly.idx_k, nullptr, C.x, C.ik_raw, nullptr, 1.0f, gf::kTypeBF16, g.n_embd, g.idx_key};
+        for (int i = 0; i < nk; ++i) {
+            k[i].ncol = n;
+            k[i].xq_cstride = (int64_t) q8_bytes(E);
+            k[i].xf_cstride = E;
+            k[i].y_cstride = i == 0 ? g.lat_row() : g.idx_key;
+        }
+        if (!gf::mv(k, nk, s)) {
+            err = "glm mtp: the cache rows' projections";
+            return false;
+        }
+        for (int i = 0; i < n; ++i) {
+            gf::Dsa53PrepArgs d;
+            d.kv_raw = C.kv_raw + (size_t) i * g.lat_row();
+            d.kv_norm = Ly.kv_a_norm;
+            d.lat = (uint16_t*) (state_ + dsa_lat_[(size_t) mtp_il_]);
+            d.kv_lora = g.kv_lora;
+            d.qk_rope = g.qk_rope;
+            d.ik_raw = own ? C.ik_raw + (size_t) i * g.idx_key : nullptr;
+            d.k_norm_w = Ly.k_norm_w;
+            d.k_norm_b = Ly.k_norm_b;
+            d.ik_cache = own ? state_ + dsa_ik_[(size_t) mtp_il_] : nullptr;
+            d.idx_key = g.idx_key;
+            d.p = (int) (p0 + i);
+            d.eps = g.norm_eps;
+            d.rope_base = g.rope_base;
+            gf::dsa53_prep(d, s);
+        }
+        const cudaError_t e = cudaGetLastError();
+        if (e != cudaSuccess) {
+            err = std::string("glm mtp cache: ") + cudaGetErrorString(e);
+            return false;
+        }
+        return true;
+    }
     gf::MvJob j[3];
     j[0] = {Ly.kv_a.q, C.xq, C.x, C.kv_raw, nullptr, 1.0f, Ly.kv_a.type, g.n_embd, g.kv_lora};
     j[1] = {Ly.idx_k, nullptr, C.x, C.ik_raw, nullptr, 1.0f, gf::kTypeBF16, g.n_embd, g.idx_key};
@@ -761,6 +821,411 @@ bool Glm5Model::decode_mtp(strata::kernels::SamplerParams& sp, int64_t max_new, 
         ok = false;
     }
     return ok;
+}
+
+// ---------------------------------------------------------------- the pipelined MTP decode on a split
+// STRATA_GLM_MTP_PIPE=1: on a split whose last part carries the NextN block, decode_mtp's round with the verify window as
+// a pipeline (glm_window.cu's win_pipe_*, the DFlash decode's window on 3+ GPUs).  A round from the last emitted token y
+// at p0 (the last part's head_x the trunk's hidden state of p0 - 1):
+//   1. draft  - the last part's NextN block chains n drafts (fast_mtp, each step's token copied out with its own event),
+//               queued on that part's stream BEFORE the window's tokens reach it (they come a pass later): the drafts
+//               run while the first parts take y;
+//   2. verify - win_pipe_begin(y), then each draft pushed as soon as it is out - every part takes the next token as soon
+//               as it hands the last one on, so a round costs about a pass plus the slowest part once per further
+//               token; the picks are read as they leave the last part and the first wrong draft cancels the ones
+//               behind it (their work still queued is skipped);
+//   3. commit - window_commit(keep), then the NextN cache takes the kept rows with the trunk's hidden states (the
+//               window's head rows on the last part) and head_x the last kept row: the next round drafts from it.
+// The tokens are exactly what the token-at-a-time loop produces for the same samples.  The length adapts as
+// decode_mtp's does (mtp_choose on the last part), up to kPipeMax - 1 drafts and STRATA_GLM_MTP_DRAFT.  Where the last
+// part has no room for token_embd the chain reads its rows from pinned host memory (mtp_draft_setup).
+namespace {
+// STRATA_GLM_MTP_PIPE_ORACLE=<file> (tests): the drafts are the file's token ids (the token loop's answer - every run of
+// digits an id) instead of the NextN block's, every STRATA_GLM_MTP_PIPE_ORACLE_ERR-th one (5; 0 none) made wrong: the
+// window, the accept and the commit checked against the token loop, also on a model without a NextN block
+const std::vector<int32_t>& mtp_pipe_oracle() {
+    static const std::vector<int32_t> v = [] {
+        std::vector<int32_t> r;
+        const char* f = getenv("STRATA_GLM_MTP_PIPE_ORACLE");
+        if (f == nullptr || f[0] == '\0') return r;
+        FILE* fp = std::fopen(f, "r");
+        if (fp == nullptr) return r;
+        long cur = -1;
+        for (int c; (c = std::fgetc(fp)) != EOF;) {
+            if (c >= '0' && c <= '9') {
+                cur = (cur < 0 ? 0 : cur * 10) + (c - '0');
+            } else if (cur >= 0) {
+                r.push_back((int32_t) cur);
+                cur = -1;
+            }
+        }
+        if (cur >= 0) r.push_back((int32_t) cur);
+        std::fclose(fp);
+        return r;
+    }();
+    return v;
+}
+}  // namespace
+
+bool Glm5Model::mtp_pipe_wanted() {
+    static const bool v = [] {
+        const char* e = getenv("STRATA_GLM_MTP_PIPE");
+        if (e == nullptr || std::atoi(e) == 0) return false;
+        if (getenv("STRATA_GLM_NO_SPEC") != nullptr || getenv("STRATA_GLM_NO_MTP") != nullptr) return false;
+        if (mtp_draft_cap() <= 0) return false;
+        if (const char* q = getenv("STRATA_GLM_SEQS"); q != nullptr && std::atoi(q) > 1) return false;   // (--parallel)
+        if (const char* d = getenv("STRATA_GLM_DFLASH"); d != nullptr && d[0] != '\0') return false;
+        return true;
+    }();
+    return v;
+}
+
+bool Glm5Model::mtp_pipe_ready() const {
+    if (fast_ == nullptr || split_next_ == nullptr || !mtp_pipe_) return false;
+    const Glm5Model* last = this;
+    for (const Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) {
+        if (m->fast_ == nullptr || !m->mtp_pipe_) return false;
+        last = m;
+    }
+    return (last->mtp_il_ >= 0 && last->mtp_dec_) || !mtp_pipe_oracle().empty();
+}
+
+bool Glm5Model::decode_mtp_pipe(strata::kernels::SamplerParams& sp, int64_t max_new,
+                                const std::function<bool(int)>& emit, int64_t& produced, std::string& err) {
+    produced = 0;
+    if (!mtp_pipe_ready()) {
+        err = "glm mtp pipe: not set up on this split";
+        return false;
+    }
+    Glm5Model* tail = this;
+    while (tail->split_next_) tail = tail->split_next_.get();
+    FastState* FT = tail->fast_;
+    const Glm5Geometry& g = g_;
+    const int64_t E = g.n_embd;
+    const std::vector<int32_t>& oracle = mtp_pipe_oracle();
+    const bool use_oracle = !oracle.empty();
+    static const int oracle_err = [] {
+        const char* e = getenv("STRATA_GLM_MTP_PIPE_ORACLE_ERR");
+        return e != nullptr ? std::max(0, std::atoi(e)) : 5;
+    }();
+    const int n_cap = std::min(mtp_draft_cap(), kPipeMax - 1);
+    static const bool trace = getenv("STRATA_GLM_MTP_TRACE") != nullptr;
+    static const bool prof = getenv("STRATA_GLM_MTP_PROF") != nullptr;
+    // the first token: the prompt's last forward left its logits on the last part
+    int y = -1;
+    if (sp.greedy && last_tok_ >= 0) {
+        y = last_tok_;
+    } else {
+        y = sample_token(sp, err);
+        if (y < 0) return false;
+    }
+    y = forced(y);
+    sp.counter += 1;
+    ++produced;
+    if (!emit(y) || produced >= max_new || pos_ + 1 >= max_ctx_) return true;
+    cudaSetDevice(tail->dev_);
+    if (tail->mtp_step_ev_.empty()) {
+        tail->mtp_step_ev_.assign((size_t) kPipeMax, nullptr);
+        for (cudaEvent_t& e : tail->mtp_step_ev_)
+            if (cudaEventCreateWithFlags(&e, cudaEventDisableTiming) != cudaSuccess) {
+                cudaGetLastError();
+                cudaSetDevice(dev_);
+                err = "glm mtp pipe: the draft steps' events did not create";
+                return false;
+            }
+    }
+    cudaSetDevice(dev_);
+    // the last window's late tokens and the commit behind them done before the caller reads the state - on every way
+    // out, an error's too
+    struct Drain {
+        Glm5Model* m;
+        ~Drain() {
+            for (Glm5Model* p = m; p != nullptr; p = p->split_next_.get()) {
+                cudaSetDevice(p->dev_);
+                cudaStreamSynchronize(p->fast_->cs);
+            }
+            cudaSetDevice(m->dev_);
+        }
+    } drain_on_exit{this};
+    const bool chain = FT->mtp_emb != nullptr;
+    constexpr double kOutMax = 0.02;   // (decode_mtp's: above it the drafts take the whole head)
+    // STRATA_GLM_SPEC_SAMPLE=1: SPECULATIVE SAMPLING for a sampled request (decode_spec's, over the whole chain) - draft
+    // step i is DRAWN from the NextN head's own distribution q_i (sample_draft, its kept list in spec_qs[i]) with the
+    // counter of window row i, and row i keeps it with probability min(1, p/q), else draws from max(0, p - q)
+    // (sample_verify on the last part): every token keeps the plain draw's distribution, and a draft stands
+    // sum(min(p, q)) of the time instead of p(argmax q).  A fixed seed still repeats its answer - but not the plain
+    // draw's.  Greedy requests and penalties keep the argmax drafts and the exact match.
+    static const bool spec_env = [] {
+        const char* e = getenv("STRATA_GLM_SPEC_SAMPLE");
+        return e != nullptr && std::atoi(e) != 0;
+    }();
+    bool spec_sample = spec_env && !use_oracle && !sp.greedy && sp.temperature > 0.0f && sp.penalty_last_n <= 0 &&
+                       sp.logit_bias == nullptr;
+    if (spec_sample && FT->spec_qs == nullptr) {
+        cudaSetDevice(tail->dev_);
+        if (cudaMalloc(&FT->spec_qs, (size_t) kPipeMax * sizeof(strata::kernels::SpecList)) != cudaSuccess) {
+            cudaGetLastError();
+            FT->spec_qs = nullptr;
+            spec_sample = false;
+            std::fprintf(stderr, "glm mtp pipe: STRATA_GLM_SPEC_SAMPLE - the draft lists did not allocate; plain draws\n");
+        }
+        cudaSetDevice(dev_);
+    }
+    std::vector<strata::kernels::SamplerParams> dsp((size_t) kPipeMax);   // draft step i's sampler (row i's counter)
+    struct SpecOff {
+        Glm5Model* m;
+        ~SpecOff() {
+            if (m == nullptr) return;
+            m->mtp_sample_ = nullptr;
+            m->fast_->win.spec_qs = nullptr;
+            m->fast_->win.spec_drafts = nullptr;
+            m->fast_->win.spec_rows = 0;
+        }
+    } spec_off{tail};
+    static const double acc_keep = [] {
+        const char* e = getenv("STRATA_GLM_MTP_ACC_WINDOW");
+        const int w = e != nullptr ? std::max(0, std::atoi(e)) : 64;
+        return w > 0 ? 1.0 - 1.0 / (double) w : 1.0;
+    }();
+    const auto note = [&](int tok) {
+        const bool outside = !tail->mtp_vin_.empty() && tok >= 0 && tok < (int) tail->mtp_vin_.size() &&
+                             !tail->mtp_vin_[(size_t) tok];
+        tail->mtp_out_ += ((outside ? 1.0 : 0.0) - tail->mtp_out_) / 64.0;
+    };
+    note(y);
+    std::vector<int32_t> tok, out;
+    int64_t rounds = 0, plain = 0, drafted = 0, accepted = 0;
+    int64_t reach[kPipeMax] = {}, hit[kPipeMax] = {};   // per draft depth: compared (every draft before it stood), accepted
+    double ph_draft = 0, ph_push = 0, ph_pick = 0, ph_rest = 0;   // the host's phases a round (STRATA_GLM_MTP_PROF)
+    // a window that waits for the devices (the tiers' boundary runs on all of them) every STRATA_GLM_MTP_PIPE_FRESH-th
+    // round (8, as the DFlash decode's); 0: only the first - where every expert stays put (a complete pool, no
+    // promotions) the boundary has nothing to do and the wait is a bubble
+    static const int fresh_every = [] {
+        const char* e = getenv("STRATA_GLM_MTP_PIPE_FRESH");
+        return e != nullptr ? std::max(0, std::atoi(e)) : 8;
+    }();
+    using clk = std::chrono::steady_clock;
+    const auto ms_between = [](clk::time_point a, clk::time_point b) {
+        return std::chrono::duration<double, std::milli>(b - a).count();
+    };
+    for (;;) {
+        const int64_t p0 = pos_;
+        const auto t0 = clk::now();
+        int n = use_oracle ? n_cap : tail->mtp_choose(n_cap);
+        n = (int) std::min<int64_t>(n, max_new - produced - 1);
+        n = (int) std::min<int64_t>(n, max_ctx_ - 1 - p0);
+        if (use_oracle) n = (int) std::min<int64_t>(n, (int64_t) oracle.size() - produced);
+        else if (tail->mtp_hx_pos_ != p0 - 1) n = 0;   // (no trunk state to draft from: a plain token)
+        n = std::max(n, 0);
+        if (n == 0) {
+            // a plain token (the token path keeps the NextN cache: entry p0 - 1)
+            std::vector<float> lg;
+            if (!forward({y}, lg, err)) return false;
+            const int y2 = forced(sample_token(sp, err));
+            if (y2 < 0) return false;
+            ++plain;
+            ++rounds;
+            ++mtp_rounds_;
+            ++mtp_round_n_[0];
+            // the length 0's measurement too (mtp_choose probes it where length 1 is the best: unmeasured, its stint
+            // never ended and every later round stayed a plain token)
+            const double ms = ms_between(t0, clk::now());
+            if (tail->mtp_prev_n_ == 0) {
+                ++tail->mtp_same_;
+            } else {
+                tail->mtp_prev_n_ = 0;
+                tail->mtp_same_ = 0;
+            }
+            if (tail->mtp_same_ >= 2) {
+                tail->mtp_ms_[0] += (ms - tail->mtp_ms_[0]) / (double) std::min<uint64_t>(tail->mtp_seen_[0] + 1, 10);
+                ++tail->mtp_seen_[0];
+            }
+            sp.counter += 1;
+            ++produced;
+            last_tok_ = y2;
+            note(y2);
+            if (!emit(y2) || produced >= max_new || pos_ + 1 >= max_ctx_) break;
+            y = y2;
+            continue;
+        }
+        const int T = 1 + n;
+        tok.assign((size_t) T, 0);
+        out.assign((size_t) T, -1);
+        tok[0] = y;
+        // ---- 1. the drafts, queued on the last part ahead of the window's tokens
+        bool sub = false;
+        if (use_oracle) {
+            for (int i = 0; i < n; ++i) {
+                const int64_t at = produced + i;
+                int32_t d = oracle[(size_t) at];
+                if (oracle_err > 0 && at % oracle_err == oracle_err - 1) d = (d + 1) % (int32_t) g.n_vocab;
+                tok[(size_t) i + 1] = d;
+            }
+        } else {
+            cudaSetDevice(tail->dev_);
+            if (!FT->route_ok(err)) return false;
+            sub = !spec_sample && FT->mtp_dv > 0 && tail->mtp_out_ < kOutMax;   // (a drawn draft needs the whole head)
+            if (chain) {
+                for (int i = 0; i < n; ++i) {
+                    if (spec_sample) {
+                        dsp[(size_t) i] = sp;
+                        dsp[(size_t) i].counter = sp.counter + (uint64_t) i;
+                        tail->mtp_sample_ = &dsp[(size_t) i];
+                    }
+                    if (!tail->fast_mtp(p0 - 1 + i, i == 0 ? y : -1, err, i, sub, false)) return false;
+                    cudaMemcpyAsync(FT->mtp_tok_h + i, FT->mtp_tok + i, sizeof(int), cudaMemcpyDeviceToHost, FT->cs);
+                    cudaEventRecord(tail->mtp_step_ev_[(size_t) i], FT->cs);
+                }
+            } else {
+                // step by step (each step's token through the host): the drafts are out before the window begins
+                int32_t t = y;
+                for (int i = 0; i < n; ++i) {
+                    if (spec_sample) {
+                        dsp[(size_t) i] = sp;
+                        dsp[(size_t) i].counter = sp.counter + (uint64_t) i;
+                        tail->mtp_sample_ = &dsp[(size_t) i];
+                    }
+                    if (!tail->fast_mtp(p0 - 1 + i, t, err, i, sub) ||
+                        !glmfast::wait_event(FT->ev_mtp, "glm mtp pipe draft", err) || !FT->route_ok(err))
+                        return false;
+                    t = FT->mtp_tok_h[i];
+                    tok[(size_t) i + 1] = t;
+                }
+            }
+            tail->mtp_hx_pos_ = -1;   // (head_x holds the block's hidden state now)
+            cudaSetDevice(dev_);
+        }
+        const auto t1 = clk::now();
+        // ---- 2. the verify: y through every part now; each draft behind it as soon as it is out.  A window follows
+        //         the last one's late tokens without waiting for the devices; every 8th waits, so the tiers' boundary
+        //         runs even when no window finds the devices idle
+        // (the last part's picks: rows 0 .. n - 1 verify the drawn drafts; set before the window's first token is queued)
+        FT->win.spec_qs = spec_sample ? FT->spec_qs : nullptr;
+        FT->win.spec_drafts = spec_sample ? FT->mtp_tok : nullptr;
+        FT->win.spec_rows = spec_sample ? n : 0;
+        if (!win_pipe_begin(y, err, &sp, rounds == 0 || (fresh_every > 0 && rounds % fresh_every == 0))) return false;
+        const int bank = FT->win.bank;   // (the last part's head rows of this window)
+        for (int i = 0; i < n; ++i) {
+            if (!use_oracle && chain) {
+                cudaSetDevice(tail->dev_);
+                cudaError_t e;
+                while ((e = cudaEventQuery(tail->mtp_step_ev_[(size_t) i])) == cudaErrorNotReady) std::this_thread::yield();
+                cudaSetDevice(dev_);
+                if (!glmfast::cuda_ok(e, "glm mtp pipe draft", err)) return false;
+                tok[(size_t) i + 1] = FT->mtp_tok_h[i];
+            }
+            if (!win_pipe_push(tok[(size_t) i + 1], err)) return false;
+        }
+        const auto t2 = clk::now();
+        // the picks as their tokens leave the last part, up to the first that is not the next draft
+        for (int t = 0; t < T; ++t) {
+            if (!win_pipe_pick(t, out[(size_t) t], err)) return false;
+            if (t + 1 >= T) break;
+            if (tok[(size_t) t + 1] != out[(size_t) t]) {
+                win_pipe_cancel_from(t + 1);
+                break;
+            }
+        }
+        if (!win_pipe_settle(err)) return false;
+        const auto t3 = clk::now();
+        // ---- the accept: the longest right prefix of the drafts, each kept token out in turn (a forced next token -
+        //      the reasoning closed by the caller - ends the run there, like a wrong draft)
+        int acc = 0;
+        while (acc < T - 1 && tok[(size_t) acc + 1] == out[(size_t) acc]) ++acc;
+        for (int i = 1; i <= std::min(acc + 1, T - 1); ++i) {
+            ++reach[i];
+            hit[i] += i <= acc ? 1 : 0;
+        }
+        for (int i = 1; i <= std::min(acc + 1, T - 1) && i < 9; ++i) {
+            tail->mtp_hit_[i] *= acc_keep;
+            tail->mtp_reach_[i] = tail->mtp_reach_[i] * acc_keep + 1.0;
+            if (i <= acc) tail->mtp_hit_[i] += 1.0;
+        }
+        bool more = true;
+        int kept = 0;   // drafts emitted
+        for (; kept < acc; ++kept) {
+            sp.counter += 1;
+            ++produced;
+            note(tok[(size_t) kept + 1]);
+            more = emit(tok[(size_t) kept + 1]) && produced < max_new;
+            if (!more || force_tok_ >= 0) {
+                ++kept;
+                break;
+            }
+        }
+        const int keep = 1 + kept;
+        const int y2 = forced(out[(size_t) keep - 1]);
+        // ---- 3. the commit, the NextN cache's kept rows and the next round's head_x
+        if (!window_commit(keep, err)) return false;
+        if (!use_oracle) {
+            cudaSetDevice(tail->dev_);
+            const float* rows = FT->win.head_x + (size_t) bank * kPipeMax * E;
+            if (keep > 1 && !tail->mtp_cache_rows(p0, keep - 1, rows, tok.data() + 1, err, false)) return false;
+            cudaMemcpyAsync(FT->head_x, rows + (size_t) (keep - 1) * E, (size_t) E * sizeof(float),
+                            cudaMemcpyDeviceToDevice, FT->cs);
+            tail->mtp_hx_pos_ = p0 + keep - 1;
+            cudaSetDevice(dev_);
+        }
+        // the statistics and the adaptive length's measurements (decode_mtp's)
+        ++rounds;
+        ++mtp_rounds_;
+        ++mtp_round_n_[std::min(n, 8)];
+        drafted += n;
+        accepted += acc;
+        spec_steps_ += (uint64_t) n;
+        spec_hits_ += (uint64_t) acc;
+        const auto t4 = clk::now();
+        const double ms = ms_between(t0, t4);
+        if (n == tail->mtp_prev_n_) {
+            ++tail->mtp_same_;
+        } else {
+            tail->mtp_prev_n_ = n;
+            tail->mtp_same_ = 0;
+        }
+        if (tail->mtp_same_ >= 2 && n < 9) {
+            tail->mtp_ms_[n] += (ms - tail->mtp_ms_[n]) / (double) std::min<uint64_t>(tail->mtp_seen_[n] + 1, 10);
+            ++tail->mtp_seen_[n];
+        }
+        if (prof) {
+            ph_draft += ms_between(t0, t1);
+            ph_push += ms_between(t1, t2);
+            ph_pick += ms_between(t2, t3);
+            ph_rest += ms_between(t3, t4);
+        }
+        if (trace)
+            std::fprintf(stderr, "glm mtp pipe: p0 %lld drafts %d accepted %d kept %d (%.1f ms)\n", (long long) p0, n,
+                         acc, keep, ms);
+        if (!more) break;
+        sp.counter += 1;
+        ++produced;
+        last_tok_ = y2;
+        note(y2);
+        if (!emit(y2) || produced >= max_new || pos_ + 1 >= max_ctx_) break;
+        y = y2;
+    }
+    win_prof_report();
+    if (rounds > 0)
+        std::fprintf(stderr, "glm mtp pipe: %lld rounds (%lld plain), %.2f drafts and %.2f accepted a round%s\n",
+                     (long long) rounds, (long long) plain, (double) drafted / (double) rounds,
+                     (double) accepted / (double) rounds,
+                     use_oracle ? " (oracle drafts)" : spec_sample ? " (speculative sampling)" : "");
+    if (rounds > plain) {
+        std::string by;
+        for (int i = 1; i < kPipeMax && reach[i] > 0; ++i)
+            by += " d" + std::to_string(i) + " " + std::to_string((int) (100.0 * (double) hit[i] / (double) reach[i] + 0.5)) +
+                  "% of " + std::to_string((long long) reach[i]);
+        std::fprintf(stderr, "glm mtp pipe: drafts accepted by depth (given the ones before stood):%s\n", by.c_str());
+    }
+    if (prof && rounds > plain)
+        std::fprintf(stderr, "glm mtp pipe (host ms a drafting round): drafts %.2f | begin + pushes %.2f | picks %.2f | "
+                             "commit + cache %.2f\n", ph_draft / (double) (rounds - plain),
+                     ph_push / (double) (rounds - plain), ph_pick / (double) (rounds - plain),
+                     ph_rest / (double) (rounds - plain));
+    if (gf::launch_errors() > 0) {
+        err = "glm mtp pipe: a kernel launch failed (see stderr)";
+        return false;
+    }
+    return true;
 }
 
 }  // namespace strata::core

@@ -102,9 +102,10 @@ void hc(const HcArgs& a, cudaStream_t s);
 void hc_post(const float* block_out, const float* R_old, const float* post, const float* comb, int n_embd,
              float* R_new, cudaStream_t s);
 /// The head's prologue: mean over the 4 streams of R, rms_norm * norm_w -> x (f32) and xq (q8_1).
-void head_prep(const float* R, const float* norm_w, float eps, int n_embd, float* x, void* xq, cudaStream_t s);
+void head_prep(const float* R, const float* norm_w, float eps, int n_embd, float* x, void* xq, cudaStream_t s,
+               int hc = 4);   // hc 1: glm-dsa's one stream
 /// R[s][e] = emb[e] for the 4 streams.
-void embed_streams(const float* emb, float* R, int n_embd, cudaStream_t s);
+void embed_streams(const float* emb, float* R, int n_embd, cudaStream_t s, int hc = 4);   // R[s][e] for hc streams
 
 /// KDA, after the projections: the three causal convs (+SiLU, + the history slide), the q/k l2
 /// norms, and the two gate GEMVs (f_b with dt bias and the lower-bound squash -> g1; g_b -> g2).
@@ -152,12 +153,42 @@ struct DsaPrepArgs {
     float eps = 1e-5f;
 };
 void dsa_prep(const DsaPrepArgs& a, cudaStream_t s);
+
+// ---- glm-dsa (the full GLM-5.3, docs/GLM53-ENGINE-PORT.md P3): the token path's DSA pieces
+struct Dsa53PrepArgs {
+    // the q_a norm into qr / qr_q (qr_raw null: the cache rows only)
+    const float* qr_raw = nullptr; const float* q_a_norm = nullptr; float* qr = nullptr; void* qr_q = nullptr;
+    int q_lora = 2048;
+    // the cache row p: [rms(kv_raw[0:kv_lora]) * kv_norm | rope(kv_raw[kv_lora:kv_lora+qk_rope])] in FP16
+    const float* kv_raw = nullptr; const float* kv_norm = nullptr; uint16_t* lat = nullptr;
+    int kv_lora = 512, qk_rope = 64;
+    // a full indexer layer's key: rope(layer_norm(ik_raw)) into ik_cache[p] (ik_raw null: a shared layer, no key)
+    const float* ik_raw = nullptr; const float* k_norm_w = nullptr; const float* k_norm_b = nullptr;
+    float* ik_cache = nullptr;
+    int idx_key = 128;
+    int p = 0;
+    float eps = 1e-5f, rope_base = 10000.0f;
+};
+void dsa53_prep(const Dsa53PrepArgs& a, cudaStream_t s);
+/// h += add (n floats) - the plain residual's last write.
+void add_into(float* h, const float* add, int n, cudaStream_t s);
+/// RoPE (llama.cpp's NORM: consecutive pairs) on n_rot features at `off` of n_vec vectors `stride` floats apart.
+void rope_norm(float* x, int n_vec, int stride, int off, int n_rot, long long pos, float base, cudaStream_t s);
+/// The absorbed MLA with the RoPE tail, one token: q per head [nope qk_nope | rope qk_rope] (the rope part already
+/// rotated), cache rows FP16 [latent kv_lora | k_rope qk_rope]; writes the q8_1 of the n_head * v_head output.
+void mla53(const float* q, const uint16_t* wk_b, const uint16_t* wv_b, const uint16_t* lat, const int* cells, int n_sel,
+           int n_head, int qk_nope, int qk_rope, int kv_lora, int v_head, void* out_q8_1, cudaStream_t s);
 /// score[p] = sum_h relu(iq_h . pooled_p) * iw_h for the n_pools completed pools.
 void dsa_score(const float* iq, const float* pooled, const float* iw, int key_dim, int idx_heads, int n_pools,
                float* score, cudaStream_t s);
-/// The stable top-k of the pools (ties by lower index) expanded to cells, then the tail cells.
+/// The top-k of the pools (ties by lower index) expanded to cells in ascending pool order, then the tail cells.
+/// ws: kSelWsBytes of device memory of this stream's own (FastState::sel_ws) - with it a long context (n_vis from
+/// STRATA_GLM_SEL_MULTI, default kSelMultiFrom; 0 = never) is selected by several blocks instead of one; the same
+/// cells either way.  nullptr: one block.
+constexpr size_t kSelWsBytes = 8192;
+constexpr int kSelMultiFrom = 28672;   // RTX 3090: one block 24.5 us at 24K, 46 at 32K; several blocks 27-34 us at any size
 void dsa_select(const float* score, int n_vis, int kpool, int top_pools, int n_sel, int pos, int* cells,
-                cudaStream_t s);
+                cudaStream_t s, void* ws = nullptr);
 /// Absorbed MLA for one token, per head: q_abs = wk_b_h . q_h, scores over the selected latents,
 /// softmax, ctx, out_h = wv_b_h . ctx; writes the q8_1 of the n_head * v_head output.
 /// lat_q8: the cache holds INT8 latent records (see lat8_rec_bytes), else FP16 rows of kv_lora.
@@ -221,10 +252,12 @@ struct MoeDev {
     unsigned int mt_xq_s = 0, mt_hq_s = 0, mt_sh_hq_s = 0, mt_out_s = 0, mt_cpu_s = 0;
 };
 /// The CPU LANE's answer: the weighted sum of the RAM-tier experts the host computed for route `seq`.
+/// The widest n_embd the host-mapped CPU-lane structures hold (Flash 4096, glm-dsa 6144).
+constexpr int kMaxEmbd = 8192;
 struct CpuAnswer {
     volatile unsigned int seq;
     unsigned int pad[3];
-    float part[4096];
+    float part[kMaxEmbd];
 };
 constexpr int kRingSize = 64;
 /// LOOKAHEAD: a route may also carry the top-k of the next (up to) kAhead layers' routers applied to its FFN input.
@@ -251,7 +284,7 @@ struct MoeRequest {
     short near_ids[16];          // STRATA_GLM_ROUTE_LOG only: the route's next ranks after the top k (-1: none)
     int win;                     // ... and the answer slot they go to: a verify window's token (0: the lone answer)
     int win_n;                   // a batched verify window's tokens (0: not one): their CPU lanes may run at once
-    float x[4096];               // the FFN input, written only when cpu_mask != 0
+    float x[kMaxEmbd];           // the FFN input, written only when cpu_mask != 0
 };
 /// The host's answer to a request with misses.
 struct MoeResponse {
@@ -262,7 +295,7 @@ struct MoeResponse {
     int upd_key[64];
     unsigned long long upd_val[64];
     int cpu;                          // 1: cpu_part (host-mapped, below) holds the missed experts' weighted sum
-    float cpu_part[4096];
+    float cpu_part[kMaxEmbd];
 };
 /// Router (sigmoid + bias, stable top-k, normalised weights - router_sigmoid's arithmetic), the plan
 /// lookup in `tab`, the request publish, and the shared expert's swiglu + q8_1.
@@ -343,10 +376,10 @@ bool rows_experts(int gu_type, int d_type, const uint8_t* base, size_t stride, s
 /// tab[keys[i]] = vals[i] for i < n (the expert-table edits the host queues between tokens).
 void tab_update(unsigned long long* tab, const int* keys, const unsigned long long* vals, int n, cudaStream_t s);
 
-/// The NextN block's input: cat = [rms(emb) * enorm, rms(h) * hnorm] (2 n values) as q8_1.  n <= 4096.
+/// The NextN block's input: cat = [rms(emb) * enorm, rms(h) * hnorm] (2 n values) as q8_1.  n <= 8192.
 void mtp_in(const float* emb, const float* h, const float* enorm, const float* hnorm, float eps, int n, void* cat_q8_1,
             cudaStream_t s);
-/// h += add (add may be null), then x = rms(h) * w and its q8_1 (a plain pre-norm residual step).  n <= 4096.
+/// h += add (add may be null), then x = rms(h) * w and its q8_1 (a plain pre-norm residual step).  n <= 8192.
 void rms_q8(float* h, const float* add, const float* w, float eps, int n, float* x, void* xq, cudaStream_t s);
 
 /// A chained draft's embedding: out = row *tok (a device int) of token_embd on the device (n_rows rows of type 14 =

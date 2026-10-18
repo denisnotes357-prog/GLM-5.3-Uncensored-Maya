@@ -1,0 +1,7 @@
+{"name": "tiny-iq4",
+ "note": "test recipe for the tiny synthetic GLM-5.3: routed experts IQ4_XS (a type both the fast MoE kernels and the reference step's CPU experts take), everything else 2-D Q6_K, router and indexer head weights F32 - the fast path is compared with the reference step on the SAME pack",
+ "rules": [
+  {"match": "ffn_(gate|up|down)_exps", "type": "IQ4_XS"},
+  {"match": "ffn_gate_inp|exp_probs_b|indexer\\.proj", "type": "F32"}
+ ],
+ "default": "Q6_K"}

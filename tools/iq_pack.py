@@ -96,14 +96,47 @@ GLM5NEXT_NATIVE_OK = (
     # dequantizes them into the F32 arena at load (2x ~1.2 GB quantized)
     "token_embd.weight", "output.weight",
 )
-ARCHITECTURES = ("qwen4exp", "glm5-next", "glm5next")   # unsloth spells it without the hyphen
+
+# The same two sets for "glm-dsa" (the full GLM-5.3, tools/glm53 recipe G-L): NO hc_* (no mHC),
+# NO ssm_* (no KDA layer) and NO indexer_compressor_* (its indexer picks the tokens itself, so the
+# pack has no kpool weights to carry).  What it does keep beyond the Flash list is the NextN block's
+# three norms and eh_proj; indexer.proj's F32 is a recipe choice, so it lives on the BF16 upgrade
+# list (upgraded only when --compat-bf16 turns an F32/quantized copy into the BF16 the kernels read).
+GLMDSA_BF16 = (
+    "indexer.attn_q_b.weight", "indexer.attn_k.weight", "indexer.proj.weight",
+    "indexer.k_norm.weight", "indexer.k_norm.bias",
+    "ffn_gate_inp.weight", "exp_probs_b.bias",
+    "attn_q_a_norm.weight", "attn_kv_a_norm.weight",
+    "attn_k_b.weight", "attn_v_b.weight",
+    "nextn.enorm.weight", "nextn.hnorm.weight", "nextn.shared_head_norm.weight",
+)
+# The ONLY non-expert tensors a glm-dsa pack may serve NATIVELY (the Phase-4 native reader's set,
+# fail-closed exactly as GLM5NEXT_NATIVE_OK is above).
+GLMDSA_NATIVE_OK = (
+    "attn_q_a.weight", "attn_q_b.weight", "attn_kv_a_mqa.weight", "attn_output.weight",
+    "ffn_gate.weight", "ffn_up.weight", "ffn_down.weight",
+    "ffn_gate_shexp.weight", "ffn_up_shexp.weight", "ffn_down_shexp.weight",
+    "token_embd.weight", "output.weight", "nextn.eh_proj.weight",
+)
+ARCHITECTURES = ("qwen4exp", "glm5-next", "glm5next", "glm-dsa")   # unsloth spells glm5-next without
+                                                                       # the hyphen; llama.cpp's GlmMoeDsa
+                                                                       # converter writes "glm-dsa"
+
+
+def is_glm5(arch: str) -> bool:
+    """the architectures the GLM runner packs: Flash (glm5-next / glm5next) and the full GLM-5.3
+    (glm-dsa).  The KV prefix follows the arch string in every case."""
+    return arch in ("glm5-next", "glm5next", "glm-dsa")
 
 
 def needs_bf16(name: str, type_name: str, arch: str = "qwen4exp") -> bool:
-    if arch in ("glm5-next", "glm5next"):
-        # glm5-next has no PLE and no output_hc; its F32 router stays F32 (the runner reads it
-        # as F32 by config), so ONLY the listed projections take the BF16 path.
-        return name.startswith("blk.") and name.endswith(GLM5NEXT_BF16)
+    if is_glm5(arch):
+        # neither GLM arch has PLE or output_hc, and its F32 router stays F32 (the runner reads it
+        # as F32 by config), so ONLY the listed projections take the BF16 path - the list differs:
+        # Flash also has the mHC mixes, the kpool compressors and the KDA gates, glm-dsa has none
+        # of those but does store the NextN block's norms.
+        return name.startswith("blk.") and name.endswith(
+            GLMDSA_BF16 if arch == "glm-dsa" else GLM5NEXT_BF16)
     if name in BF16_OUTPUT:
         return True
     if not name.startswith("blk."):
@@ -201,6 +234,8 @@ def index_standalone(src, out, model: Model, compat_bf16: bool = False, arch: st
     else is a hard error.  The NextN/MTP block (blk.{block_count}.*, the runner skips MTP) is
     dropped from the pack entirely."""
     dropped = 0
+    native_ok = GLMDSA_NATIVE_OK if arch == "glm-dsa" else GLM5NEXT_NATIVE_OK
+    native_name = "GLMDSA_NATIVE_OK" if arch == "glm-dsa" else "GLM5NEXT_NATIVE_OK"
     if not compat_bf16:
         for name, (_, t, _, _) in model.where.items():
             if needs_bf16(name, t.type_name, arch) and t.type_name != "BF16" and not (
@@ -222,7 +257,7 @@ def index_standalone(src, out, model: Model, compat_bf16: bool = False, arch: st
             # a trailing ne3 of 1 adds no bytes: some converters write glm5-next's conv weights as
             # [4, 1, 8192, 1] instead of [4, 1, 8192], and index_shape packs both as (4, 8192)
             dims = len(t.shape) - (len(t.shape) == 4 and int(t.shape[3]) == 1)
-            if dims > 2 and not (arch in ("glm5-next", "glm5next") and dims == 3):
+            if dims > 2 and not (is_glm5(arch) and dims == 3):
                 print("tensor %s has %d dimensions; the index holds two" % (t.name, len(t.shape)))
                 return 1
             ne0, ne1 = index_shape(t.shape)
@@ -248,9 +283,11 @@ def index_standalone(src, out, model: Model, compat_bf16: bool = False, arch: st
                 pad = (-len(raw)) % ALIGN
                 fo.write(b"\0" * pad)
                 at += len(raw) + pad
-            elif arch in ("glm5-next", "glm5next") and not name.endswith(GLM5NEXT_NATIVE_OK):
-                print("%s is %s: not on the BF16 upgrade list nor the glm5-next native set "
-                      "(GLM5NEXT_NATIVE_OK); refusing to pack it silently" % (t.name, t.type_name))
+            elif is_glm5(arch) and not name.endswith(native_ok):
+                label = "glm-dsa" if arch == "glm-dsa" else "glm5-next"
+                print("%s is %s: not on the BF16 upgrade list nor the %s native set "
+                      "(%s); refusing to pack it silently"
+                      % (t.name, t.type_name, label, native_name))
                 return 1
             else:
                 served += 1
@@ -358,15 +395,20 @@ def main() -> int:
     if arch not in ARCHITECTURES:
         print("general.architecture is %r; the packer knows %s" % (arch, " and ".join(ARCHITECTURES)))
         return 1
-    if arch in ("glm5-next", "glm5next"):
-        # two spellings in the wild: llama.cpp's canonical "glm5-next" (llama-arch.cpp L156) and
-        # unsloth's "glm5next" - the KV PREFIX follows the same spelling, so it is read per file
-        prefix = "glm5-next." if arch == "glm5-next" else "glm5next."
-        print("%s: packing for the Glm5Model runner (quantized dense served natively; the driver "
-              "gate remains closed until the pack wiring lands - docs/GLM5-FLASH.md §9)" % arch)
+    if is_glm5(arch):
+        # two spellings in the wild for Flash: llama.cpp's canonical "glm5-next" (llama-arch.cpp L156) and
+        # unsloth's "glm5next" - plus llama.cpp's "glm-dsa" for the full GLM-5.3.  The KV PREFIX
+        # follows the arch string in every case, so it is read per file.
+        prefix = {"glm5-next": "glm5-next.", "glm5next": "glm5next.", "glm-dsa": "glm-dsa."}[arch]
+        if arch == "glm-dsa":
+            print("%s: packing for the Glm5Model runner (GLM-5.3 geometry; quantized dense served "
+                  "natively; docs/GLM53-ENGINE-PORT.md P1)" % arch)
+        else:
+            print("%s: packing for the Glm5Model runner (quantized dense served natively; the driver "
+                  "gate remains closed until the pack wiring lands - docs/GLM5-FLASH.md §9)" % arch)
     block_count = None
     trunk = None
-    if arch in ("glm5-next", "glm5next"):
+    if is_glm5(arch):
         bc = g.metadata.get(prefix + "block_count")
         if bc is None:
             print("%s: %sblock_count is missing; cannot tell the trunk from the NextN block" % (arch, prefix))
@@ -415,7 +457,7 @@ def main() -> int:
     else:
         n_layers = 1 + max(int(n.split(".")[1]) for n in T if n.startswith("blk.") and n.endswith("_exps.weight"))
     # the MoE layers only: the leading dense blocks ship no router and no experts
-    if arch in ("glm5-next", "glm5next"):
+    if is_glm5(arch):
         lead = int(g.metadata.get(prefix + "leading_dense_block_count", 0) or 0)
     else:
         lead = int(g.metadata.get("qwen4exp.leading_dense_block_count", 0) or 0)

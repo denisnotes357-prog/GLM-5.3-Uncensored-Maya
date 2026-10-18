@@ -62,6 +62,17 @@ struct WSlot {
 /// the released GLM-5.3-Flash values as defaults (mirrors ref/glm.py::Glm5Config - the Python and
 /// C++ readers must agree key for key, which glm_model_test checks against the dumps).
 struct Glm5Geometry {
+    // Which reader validated this GGUF: Flash = the released GLM-5.3-Flash runner exactly as it was
+    // (glm5-next./glm5next. keys); Dsa = a full GLM-5.3 (general.architecture "glm-dsa"), whose keys
+    // are parsed by from_gguf_dsa with no Flash fallback.  Set by from_gguf, before any field below.
+    enum class Glm5Arch { Flash, Dsa };
+    Glm5Arch arch = Glm5Arch::Flash;
+    bool mhc = true;             // false: the plain residual of glm-dsa (no mixing, so hc = 1 and no
+                                 // Sinkhorn); true is the mHC stack the Flash kernels compute
+    int qk_rope = 0;             // RoPE tail of q/k: Flash 0 (nope-only MLA), glm-dsa rope.dimension_count
+                                 // (64, applied to the last dim of q and to the k tail in the cache)
+    float rope_base = 10000.0f;  // rope.freq_base (glm-dsa 8e6); only the port's RoPE uses it, and no
+                                 // Flash kernel reads this field, so the Flash path is unchanged
     int n_embd = 4096, n_layers = 45, n_head = 64, n_vocab = 154880;
     int nextn = 0;                     // NextN/MTP layers counted INSIDE block_count (unsloth
                                        // ships 46 with nextn 1); tensors of blk.{n_layers}+ are
@@ -80,12 +91,17 @@ struct Glm5Geometry {
     int n_expert = 288, n_exp_used = 8, n_ff_exp = 2048, n_shared = 1, n_ff_dense = 12288, dense_lead = 3;
     float w_scale = 1.0f;
     int norm_w = 1;
+    // The SwiGLU clamp the FFN/MoE kernels apply (gate above, up both ends): the released Flash clamps
+    // at 10, glm-dsa is unclamped and sets BOTH to +inf - every kernel's fminf/fmaxf is then a no-op.
     float swiglu_exp = 10.0f, swiglu_shexp = 10.0f;
 
     int d_inner() const { return kda_head_dim * n_head; }
     int top_pools_max() const { return idx_top_k / idx_kpool; }
     int n_sel_max() const { return idx_top_k + (idx_select_tail ? idx_kpool - 1 : 0); }
     bool is_recr(int il) const { return n_head_kv[(size_t) il] == 0; }
+    // floats in ONE latent-cache row: kv_lora alone for Flash's nope-only MLA (512), plus the RoPE
+    // tail glm-dsa keeps per token (512 + 64 = 576).  Nothing writes a cache row yet in P1.
+    int lat_row() const { return kv_lora + qk_rope; }
 
     static bool from_gguf(const strata::GgufFile& g, Glm5Geometry& out, std::string& err);
 };
@@ -327,6 +343,7 @@ public:
     std::vector<float*> bias_tab_;                         // logit_bias_table's tables (on the tail's device)
     int bias_dev_ = -1;                                    // ... that device
     bool step_layers(int64_t p, std::string& err);
+    bool step_layers_dsa(int64_t p, std::string& err);   // the glm-dsa reference step (GLM53-ENGINE-PORT P2)
     // ---- the cross-token pipeline: with a split and more than one token to feed (a teacher-forced
     // prompt), the next token's first half is queued on device 0 BEFORE the host waits for this
     // token's residual, so half-A(t+1) runs while half-B(t) runs on device 1.
@@ -476,6 +493,7 @@ public:
     bool fast_token(int32_t token, std::string& err);
     bool fast_layers(int64_t p, bool hop_in, std::string& err);
     bool fast_dsa(int il, int64_t p, std::string& err);     // one DSA mixer (x -> mixer)
+    bool fast_dsa53(int il, int64_t p, std::string& err);   // ... glm-dsa's (GLM53-ENGINE-PORT P3)
     bool fast_moe(int il, bool& pf_pending, std::string& err);   // one MoE FFN (x -> ffn)
     // ... its routed experts, once the router and the shared expert's gate / up have run: the token path's own
     // activations, or one row of a batched step's (multi_rows)
@@ -633,7 +651,18 @@ public:
     uint64_t mtp_rounds_ = 0;                              // verify passes (spec_steps_ / spec_hits_: drafts, accepted)
     uint64_t mtp_round_n_[9] = {};                         // ... by the draft length the round used
     bool mtp_fill_prev(int32_t token, int64_t p, std::string& err);   // the token path: entry p - 1 from head_x and token
+    /// The pipelined MTP decode on a split (src/core/glm_mtp.cu, STRATA_GLM_MTP_PIPE=1): the NextN block on the last
+    /// part drafts a chain of up to kPipeMax - 1 tokens, the pipelined verify window (win_pipe_*) runs [last token,
+    /// drafts...] through the parts at once - each part takes the next token as soon as it hands the last one on - and
+    /// the first wrong draft cancels the ones behind it.  The same tokens as the token-at-a-time loop for the same
+    /// samples.  mtp_pipe_ready(): every part was set up for it.
+    static bool mtp_pipe_wanted();
+    bool mtp_pipe_ready() const;
+    bool decode_mtp_pipe(strata::kernels::SamplerParams& sp, int64_t max_new, const std::function<bool(int)>& emit,
+                         int64_t& produced, std::string& err);
 private:
+    bool mtp_pipe_ = false;                                // the pipelined MTP decode is set up on this part
+    std::vector<cudaEvent_t> mtp_step_ev_;                 // ... the last part's: a draft step's token copied out
     bool mtp_dec_ = false;                                 // the one-GPU MTP decode is set up on this part
     int64_t mtp_hx_pos_ = -1;                              // the position whose trunk hidden state head_x holds
     // the adaptive draft length: per length n, the rounds' wall time (EMA, ms) and how many; per draft position, how

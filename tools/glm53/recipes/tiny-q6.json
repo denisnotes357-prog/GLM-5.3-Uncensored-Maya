@@ -1,0 +1,6 @@
+{"name": "tiny-q6",
+ "note": "test recipe for the tiny synthetic GLM-5.3: everything 2-D in Q6_K (the most precise type the fast MoE kernels take) so the engine's paths can be compared against the f32 reference; router and indexer head weights F32 as in G-L",
+ "rules": [
+  {"match": "ffn_gate_inp|exp_probs_b|indexer\\.proj", "type": "F32"}
+ ],
+ "default": "Q6_K"}

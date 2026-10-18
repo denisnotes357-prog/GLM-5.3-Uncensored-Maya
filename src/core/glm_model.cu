@@ -234,8 +234,11 @@ static const char* const kMtpF32[] = {"attn_norm.weight", "ffn_norm.weight", "at
                                       "nextn.hnorm.weight", "nextn.shared_head_norm.weight"};
 
 // ... and the VRAM they take
+// glm-dsa's NextN block has no k-pool compressor (its indexer selects tokens): those two names are absent there
+static bool mtp_absent_ok(const char* n, bool dsa) { return dsa && std::strstr(n, "indexer_compressor") != nullptr; }
+
 static bool mtp_dense_vram(const std::function<const strata::TensorInfo*(const std::string&)>& find, int il,
-                           uint64_t& bytes, std::string& err) {
+                           uint64_t& bytes, std::string& err, bool dsa = false) {
     const std::string P = "blk." + std::to_string(il) + ".";
     bytes = 0;
     for (const char* n : kMtpRaw) {
@@ -245,11 +248,13 @@ static bool mtp_dense_vram(const std::function<const strata::TensorInfo*(const s
                  ~(uint64_t) 255u;
     }
     for (const char* n : kMtpB16) {
+        if (mtp_absent_ok(n, dsa)) continue;
         const strata::TensorInfo* t = find(P + n);
         if (t == nullptr) { err = "mtp: " + P + n + " missing"; return false; }
         bytes += ((uint64_t) t->elements() * 2 + 255u) & ~(uint64_t) 255u;
     }
     for (const char* n : kMtpF32) {
+        if (mtp_absent_ok(n, dsa)) continue;
         const strata::TensorInfo* t = find(P + n);
         if (t == nullptr) { err = "mtp: " + P + n + " missing"; return false; }
         bytes += ((uint64_t) t->elements() * 4 + 255u) & ~(uint64_t) 255u;
@@ -398,6 +403,109 @@ __global__ void q_absorb_kernel(const float* __restrict__ wk_b, const float* __r
     y[c + (size_t) kv_lora * h + (size_t) kv_lora * n_head * t] = acc;
 }
 
+// ---- glm-dsa (the full GLM-5.3, docs/GLM53-ENGINE-PORT.md P2): the reference step's three own kernels
+
+// RoPE on n_rot features at `off` of each of n_vec vectors (`stride` floats apart): llama.cpp's
+// LLAMA_ROPE_TYPE_NORM, which GLM_DSA uses for the MLA tail and the indexer alike - CONSECUTIVE pairs
+// (2j, 2j+1) rotated by theta_j = pos * base^(-2j / n_rot).  The angle in double: at the positions a
+// long context reaches, a float angle is off by more than the parity tolerance.
+__global__ void rope_norm_kernel(float* __restrict__ x, int n_vec, int stride, int off, int n_rot, long long pos,
+                                 float base) {
+    const int half = n_rot / 2;
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n_vec * half) return;
+    const int v = idx / half, j = idx % half;
+    const double theta = (double) pos * pow((double) base, -2.0 * j / n_rot);
+    const float c = (float) cos(theta), sn = (float) sin(theta);
+    float* q = x + (size_t) v * stride + off + 2 * j;
+    const float x0 = q[0], x1 = q[1];
+    q[0] = x0 * c - x1 * sn;
+    q[1] = x0 * sn + x1 * c;
+}
+
+// q_absorb_kernel with a head stride: glm-dsa's q_b row per head is [nope | rope] (192 + 64), so the
+// nope part of head h starts at q_stride * h, not qk_nope * h.  y = (kv_lora, n_head), one token.
+__global__ void q_absorb_strided_kernel(const float* __restrict__ wk_b, const float* __restrict__ q,
+                                        float* __restrict__ y, int qk_nope, int q_stride, int kv_lora, int n_head) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= kv_lora * n_head) return;
+    const int h = idx / kv_lora, c = idx % kv_lora;
+    const float* w = wk_b + (size_t) qk_nope * kv_lora * h;   // (e, c) at e + qk_nope*c
+    const float* qh = q + (size_t) q_stride * h;
+    float acc = 0.0f;
+    for (int e = 0; e < qk_nope; ++e) acc += w[(size_t) e + (size_t) qk_nope * c] * qh[e];
+    y[c + (size_t) kv_lora * h] = acc;
+}
+
+// The absorbed MLA attention WITH the RoPE tail, one token, one block per head:
+//   score_s = (q_abs_h . lat_s[0:kv_lora] + q_rope_h . lat_s[kv_lora:kv_lora+qk_rope]) * scale
+//   ctx = sum_s softmax(score)_s * lat_s[0:kv_lora];  out_h = wv_b_h^T ctx  (wv_b at c + kv_lora*v + kv_lora*v_head*h)
+// cells[0..n_sel) are cache rows (-1 = padding, skipped).  Dynamic shared: n_sel scores + kv_lora ctx.
+__global__ void mla_rope_attention_kernel(const float* __restrict__ q_abs, const float* __restrict__ q, int q_stride,
+                                          int qk_nope, int qk_rope, const float* __restrict__ lat, int lat_row,
+                                          int kv_lora, const int* __restrict__ cells, int n_sel,
+                                          const float* __restrict__ wv_b, int v_head, float scale,
+                                          float* __restrict__ out) {
+    extern __shared__ float sh[];
+    float* sc = sh;
+    float* ctx = sh + n_sel;
+    __shared__ float red[GM_THREADS];
+    const int h = blockIdx.x, tid = threadIdx.x;
+    const float* qa = q_abs + (size_t) kv_lora * h;
+    const float* qr = q + (size_t) q_stride * h + qk_nope;
+    for (int s = tid; s < n_sel; s += blockDim.x) {
+        const int c = cells[s];
+        if (c < 0) {
+            sc[s] = -INFINITY;
+            continue;
+        }
+        const float* l = lat + (size_t) lat_row * c;
+        float acc = 0.0f;
+        for (int e = 0; e < kv_lora; ++e) acc += qa[e] * l[e];
+        for (int r = 0; r < qk_rope; ++r) acc += qr[r] * l[kv_lora + r];
+        sc[s] = acc * scale;
+    }
+    __syncthreads();
+    float m = -INFINITY;
+    for (int s = tid; s < n_sel; s += blockDim.x) m = fmaxf(m, sc[s]);
+    red[tid] = m;
+    __syncthreads();
+    for (int k = blockDim.x / 2; k > 0; k >>= 1) {
+        if (tid < k) red[tid] = fmaxf(red[tid], red[tid + k]);
+        __syncthreads();
+    }
+    m = red[0];
+    __syncthreads();
+    float sum = 0.0f;
+    for (int s = tid; s < n_sel; s += blockDim.x) {
+        const float e = sc[s] == -INFINITY ? 0.0f : expf(sc[s] - m);
+        sc[s] = e;
+        sum += e;
+    }
+    red[tid] = sum;
+    __syncthreads();
+    for (int k = blockDim.x / 2; k > 0; k >>= 1) {
+        if (tid < k) red[tid] += red[tid + k];
+        __syncthreads();
+    }
+    const float inv = red[0] > 0.0f ? 1.0f / red[0] : 0.0f;
+    for (int e = tid; e < kv_lora; e += blockDim.x) {
+        float acc = 0.0f;
+        for (int s = 0; s < n_sel; ++s) {
+            const int c = cells[s];
+            if (c >= 0) acc += sc[s] * lat[(size_t) lat_row * c + e];
+        }
+        ctx[e] = acc * inv;
+    }
+    __syncthreads();
+    const float* wv = wv_b + (size_t) kv_lora * v_head * h;
+    for (int v = tid; v < v_head; v += blockDim.x) {
+        float acc = 0.0f;
+        for (int c = 0; c < kv_lora; ++c) acc += wv[(size_t) c + (size_t) kv_lora * v] * ctx[c];
+        out[(size_t) v_head * h + v] = acc;
+    }
+}
+
 int blocks(int n) { return (n + GM_THREADS - 1) / GM_THREADS; }
 
 __global__ void bias_apply_kernel(float* __restrict__ y, const float* __restrict__ bias, float alpha,
@@ -458,11 +566,193 @@ static bool pack_dequant_tensor(const strata::TensorInfo& t, const uint8_t* src,
     return true;
 }
 
+// -----------------------------------------------------------------------------------------------
+// glm-dsa: the FULL GLM-5.3 architecture - KV prefix "glm-dsa.", what llama.cpp's GlmMoeDsa
+// converter writes (arch examples: our tiny-f32.gguf and the G-L RTN shards).  Its own keys, its own
+// flags, and NO Flash fallback for a required key: a missing one is an error, and the unknown-arch
+// refusal in from_gguf keeps every other file off this path.  Parsing only - the forward path stays
+// Flash until docs/GLM53-ENGINE-PORT.md P2, and load()/load_pack() refuse this geometry before it
+// can run anything (STRATA_GLM_DSA_DEV=1 lifts that for development).
+static bool from_gguf_dsa(const strata::GgufFile& g, Glm5Geometry& out, std::string& err) {
+    const std::string p = "glm-dsa.";
+    const auto raw = [&](const std::string& key) -> const strata::MetaValue* { return g.get(p + key); };
+    const auto missing = [&](const std::string& key) { err = "glm5_model: glm-dsa key " + key + " missing"; };
+    // a required numeric key: a scalar, or the first element of the one-element array some writers emit
+    const auto need = [&](const std::string& key, double& dst) -> bool {
+        const auto* v = raw(key);
+        if (v == nullptr) { missing(key); return false; }
+        if (v->type == strata::MetaType::ARRAY) {
+            if (v->items.empty() || !v->items[0].is_num()) { missing(key); return false; }
+            dst = v->items[0].num();
+            return true;
+        }
+        if (!v->is_num()) { missing(key); return false; }
+        dst = v->num();
+        return true;
+    };
+    const auto need_i = [&](const std::string& key, int& dst) -> bool {
+        double d = 0;
+        if (!need(key, d)) return false;
+        dst = (int) d;
+        return true;
+    };
+    // keys the spec reads but does not require: absent/wrong-typed leaves that field's own default
+    // (they are all present in both GGUFs the checks run against; nothing here is a Flash layout default)
+    const auto opt = [&](const std::string& key, double def) -> double {
+        const auto* v = raw(key);
+        if (v == nullptr) return def;
+        if (v->type == strata::MetaType::ARRAY)
+            return v->items.empty() || !v->items[0].is_num() ? def : v->items[0].num();
+        return v->is_num() ? v->num() : def;
+    };
+
+    // ---- the trunk: block_count counts the NextN block in, as every released file does
+    int block_count = 0;
+    if (!need_i("block_count", block_count)) return false;
+    out.nextn = (int) opt("nextn_predict_layers", 0);
+    out.n_layers = block_count - out.nextn;
+    if (out.n_layers < 1 || block_count < 1) {
+        err = "glm5_model: glm-dsa block_count " + std::to_string(block_count) + " - nextn " +
+              std::to_string(out.nextn) + " leaves no trunk";
+        return false;
+    }
+    if (!need_i("embedding_length", out.n_embd)) return false;
+    if (!need_i("attention.head_count", out.n_head)) return false;
+    if (!need_i("attention.q_lora_rank", out.q_lora)) return false;
+    if (!need_i("attention.kv_lora_rank", out.kv_lora)) return false;
+    if (!need_i("rope.dimension_count", out.qk_rope)) return false;
+    int key_length_mla = 0, value_length_mla = 0;
+    if (!need_i("attention.key_length_mla", key_length_mla)) return false;
+    if (!need_i("attention.value_length_mla", value_length_mla)) return false;
+    out.qk_nope = key_length_mla - out.qk_rope;  // MLA q = [nope | rope], only the tail is rotated
+    out.v_head = value_length_mla;
+    out.rope_base = (float) opt("rope.freq_base", out.rope_base);
+    if (!need_i("attention.indexer.head_count", out.idx_heads)) return false;
+    if (!need_i("attention.indexer.key_length", out.idx_key)) return false;
+    if (!need_i("attention.indexer.top_k", out.idx_top_k)) return false;
+    int key_length = 0;
+    if (!need_i("attention.key_length", key_length)) return false;
+    if (!need_i("expert_count", out.n_expert)) return false;
+    if (!need_i("expert_used_count", out.n_exp_used)) return false;
+
+    // ---- per-layer indexer: "full" runs its own, "shared" reuses the previous full layer's top-k
+    out.indexer_full.assign((size_t) out.n_layers, 1);
+    {
+        // get() keeps only the first 64 items of an array (a sample - gguf_reader.hpp read_value),
+        // while a real trunk is 78: get_full walks the header again for the WHOLE array, which is
+        // what this reader has to count and validate (the Flash path's arr_i sees <= 46 entries).
+        strata::MetaValue v;
+        if (!g.get_full(p + "attention.indexer.types", v)) {
+            missing("attention.indexer.types");  // no silent "all full" for the Dsa arch
+            return false;
+        }
+        if (v.type != strata::MetaType::ARRAY || v.items.size() < (size_t) out.n_layers) {
+            err = "glm5_model: glm-dsa key attention.indexer.types " +
+                  (v.type == strata::MetaType::ARRAY
+                       ? "has " + std::to_string(v.items.size()) + " entries, expected n_layers " +
+                             std::to_string(out.n_layers)
+                       : std::string("has the wrong type (expected BOOL array)"));
+            return false;
+        }
+        for (int il = 0; il < out.n_layers; ++il)
+            out.indexer_full[(size_t) il] = v.items[(size_t) il].u ? 1 : 0;
+        // a NextN entry, when the array carries the MTP block too, is always full
+        if (v.items.size() > (size_t) out.n_layers && !v.items[(size_t) out.n_layers].u) {
+            err = "glm5_model: glm-dsa the NextN block must have a full indexer (entry " +
+                  std::to_string(out.n_layers) + " is shared)";
+            return false;
+        }
+    }
+
+    // ---- MoE / dense / norms / vocab (not in the required list, read as the file says)
+    out.n_ff_exp = (int) opt("expert_feed_forward_length", out.n_ff_exp);
+    out.n_shared = (int) opt("expert_shared_count", out.n_shared);
+    out.n_ff_dense = (int) opt("feed_forward_length", out.n_ff_dense);
+    out.dense_lead = (int) opt("leading_dense_block_count", out.dense_lead);
+    out.w_scale = (float) opt("expert_weights_scale", out.w_scale);
+    out.norm_w = (int) opt("expert_weights_norm", out.norm_w);
+    out.norm_eps = (float) opt("attention.layer_norm_rms_epsilon", out.norm_eps);
+    if (const auto* v = raw("vocab_size"))
+        if (v->is_num()) out.n_vocab = (int) v->num();
+
+    // ---- the flags that make this arch Dsa, and the invariants the forward path will rely on
+    out.arch = Glm5Geometry::Glm5Arch::Dsa;
+    out.mhc = false;             // ordinary residual: no mixing stack, so the kernels keep ONE stream
+    out.hc = 1;
+    out.idx_kpool = 1;           // no key pooling: the indexer selects tokens itself
+    out.idx_select_tail = 0;
+    // unclamped SwiGLU: +inf turns every kernel's fminf(gate, limit) / fmaxf(fminf(up, limit), -limit) into a
+    // no-op, so the ~35 Flash call sites compute glm-dsa's plain SwiGLU without a branch of their own
+    out.swiglu_exp = INFINITY;
+    out.swiglu_shexp = INFINITY;
+    out.n_head_kv.assign((size_t) out.n_layers, 1);  // no KDA layer: head_count_kv 1 = MLA+DSA everywhere
+
+    if (key_length != out.kv_lora + out.qk_rope) {
+        err = "glm5_model: glm-dsa attention.key_length " + std::to_string(key_length) +
+              " != kv_lora_rank " + std::to_string(out.kv_lora) + " + qk_rope " + std::to_string(out.qk_rope) +
+              " (the latent cache row is kv_lora + the rope tail)";
+        return false;
+    }
+    if (out.qk_rope <= 0 || out.qk_rope > out.idx_key) {
+        err = "glm5_model: glm-dsa qk_rope " + std::to_string(out.qk_rope) +
+              " not in 1..indexer.key_length " + std::to_string(out.idx_key);
+        return false;
+    }
+    if (out.qk_nope <= 0) {
+        err = "glm5_model: glm-dsa qk_nope " + std::to_string(out.qk_nope) +
+              " is not positive (key_length_mla " + std::to_string(key_length_mla) +
+              " - qk_rope " + std::to_string(out.qk_rope) + ")";
+        return false;
+    }
+    if (out.idx_top_k <= 0) {
+        err = "glm5_model: glm-dsa attention.indexer.top_k " + std::to_string(out.idx_top_k) + " is not positive";
+        return false;
+    }
+    if (!out.indexer_full[0]) {
+        err = "glm5_model: glm-dsa layer 0 must have a full indexer (a shared layer reuses a "
+              "previous full layer's selection, so the chain must start at full)";
+        return false;
+    }
+    bool seen_full = false;   // and every later shared layer must follow a full one (llama.cpp asserts this too)
+    for (int il = 0; il < out.n_layers; ++il) {
+        if (!out.indexer_full[(size_t) il] && !seen_full) {
+            err = "glm5_model: glm-dsa layer " + std::to_string(il) +
+                  " shares an indexer but no full layer precedes it";
+            return false;
+        }
+        seen_full = seen_full || out.indexer_full[(size_t) il] != 0;
+    }
+    return true;
+}
+
+// The forward port is P2: geometry parses, weights do not need to, and the model must stop with a
+// pointer at the plan instead of running Flash arithmetic over Dsa-shaped state.
+static bool dsa_forward_guard(const Glm5Geometry& g, std::string& err) {
+    if (g.arch != Glm5Geometry::Glm5Arch::Dsa) return true;
+    if (const char* e = std::getenv("STRATA_GLM_DSA_DEV"); e != nullptr && std::string(e) == "1") return true;
+    err = "glm5_model: glm-dsa geometry parsed, but the forward path is not ported yet "
+          "(docs/GLM53-ENGINE-PORT.md P2); set STRATA_GLM_DSA_DEV=1 for development only";
+    return false;
+}
+
 }  // namespace
 
 // ================================ geometry ================================
 
 bool Glm5Geometry::from_gguf(const strata::GgufFile& g, Glm5Geometry& out, std::string& err) {
+    // The arch decides the reader (docs/GLM53-ENGINE-PORT.md P1): "glm-dsa" is the full GLM-5.3 and
+    // parses itself; "glm5-next"/"glm5next" and a file with no arch key keep the Flash code below
+    // BYTE FOR BYTE AS IT WAS; anything else stops instead of falling back to Flash defaults.
+    std::string arch;
+    if (const strata::MetaValue* a = g.get("general.architecture");
+        a != nullptr && a->type == strata::MetaType::STRING) {
+        arch = a->s;
+    }
+    if (arch == "glm-dsa") return from_gguf_dsa(g, out, err);
+    if (!arch.empty() && arch != "glm5-next" && arch != "glm5next") {
+        err = "glm5_model: unsupported architecture " + arch;
+        return false;
+    }
     // two spellings in the wild: llama.cpp's canonical "glm5-next" and unsloth's "glm5next" -
     // the KV PREFIX follows the file's own arch string, so it is detected once here
     const std::string p = g.get("glm5next.block_count") ? "glm5next." : "glm5-next.";
@@ -654,6 +944,7 @@ Glm5Model::~Glm5Model() {
 bool Glm5Model::load(const std::string& gguf_path, int64_t max_ctx, std::string& err) {
     strata::GgufFile gguf(gguf_path);
     if (!Glm5Geometry::from_gguf(gguf, g_, err)) return false;
+    if (!dsa_forward_guard(g_, err)) return false;   // glm-dsa parses, P2 ports the forward path
     max_ctx_ = max_ctx;
     dev_ = 0;
     l0_ = 0;
@@ -705,6 +996,16 @@ bool Glm5Model::load(const std::string& gguf_path, int64_t max_ctx, std::string&
             floats += (int64_t) g_.d_inner() * g_.kda_head_dim;
             kda_conv_[(size_t) il] = floats;
             floats += (int64_t) 3 * g_.d_inner() * (g_.d_conv - 1);
+        } else if (g_.arch == Glm5Geometry::Glm5Arch::Dsa) {
+            // glm-dsa: a cache row is the latent AND its RoPE tail (lat_row = 576); only a full-indexer
+            // layer keeps indexer keys (a shared one reuses the previous full layer's selection), and
+            // nothing is pooled
+            dsa_lat_[(size_t) il] = floats;
+            floats += (int64_t) g_.lat_row() * max_ctx;
+            if (g_.indexer_full[(size_t) il]) {
+                dsa_ik_[(size_t) il] = floats;
+                floats += (int64_t) g_.idx_key * max_ctx;
+            }
         } else {
             dsa_lat_[(size_t) il] = floats;
             floats += (int64_t) g_.kv_lora * max_ctx;
@@ -746,8 +1047,8 @@ bool Glm5Model::load(const std::string& gguf_path, int64_t max_ctx, std::string&
     sc_g2 = take(g_.d_inner());
     sc_gated = take(g_.d_inner());
     sc_qr = take(g_.q_lora);
-    sc_kv = take(g_.kv_lora);
-    sc_q = take((int64_t) g_.n_head * g_.qk_nope);
+    sc_kv = take(g_.lat_row());                                  // (glm-dsa: kv_a's latent + RoPE tail)
+    sc_q = take((int64_t) g_.n_head * (g_.qk_nope + g_.qk_rope));   // (Flash: qk_rope 0, unchanged)
     sc_qabs = take((int64_t) g_.kv_lora * g_.n_head);
     sc_iq = take((int64_t) g_.idx_heads * g_.idx_key);
     sc_iw = take(g_.idx_heads);
@@ -1373,7 +1674,7 @@ static std::vector<int> glm_search_bounds(const std::string& pack_dir, int64_t m
         const strata::TensorInfo* tu = findm(P + "ffn_up_exps.weight");
         const strata::TensorInfo* td = findm(P + "ffn_down_exps.weight");
         if ((g.nextn > 0 || extra) && findm(P + "nextn.eh_proj.weight") != nullptr && tg && tu && td &&
-            mtp_dense_vram(findm, L, b, e2)) {
+            mtp_dense_vram(findm, L, b, e2, g.arch == Glm5Geometry::Glm5Arch::Dsa)) {
             blob[(size_t) L] = (tensor_bytes(tg) + tensor_bytes(tu) + tensor_bytes(td)) / g.n_expert;
             stride[(size_t) L] = (double) glmfast::expert_stride((size_t) blob[(size_t) L], (int) tg->type, (int) td->type);
             mtp_dense = (double) b;
@@ -1732,6 +2033,14 @@ bool Glm5Model::load_pack_place(const std::string& pack_dir, int64_t max_ctx, st
     // pools are per-part, so 2x capacity halves the demand reads).  STRATA_GLM_SPLIT=0 forces one
     // device; =<layer>[,<layer>..] pins the boundaries; STRATA_GLM_DEV1 picks the second device of a
     // two-part split (default 1), STRATA_GLM_DEVS the devices of any split.
+    {
+        // the geometry first: the boundary checks below and the split search read g_.n_layers, which otherwise still
+        // holds Flash's default 45 (a glm-dsa split at layers past 44 was refused as out of range)
+        std::vector<std::string> names;
+        if (!pack_shard_names(pack_dir, names, err)) return false;
+        strata::GgufFile gguf(pack_dir + "/../" + names[0]);
+        if (!Glm5Geometry::from_gguf(gguf, g_, err)) return false;
+    }
     const char* sp = getenv("STRATA_GLM_SPLIT");
     const std::string spec = sp != nullptr ? std::string(sp) : layer_split;
     const auto ints = [](const std::string& s, std::vector<int>& out) {
@@ -1782,9 +2091,12 @@ bool Glm5Model::load_pack_place(const std::string& pack_dir, int64_t max_ctx, st
     bool ok = devs.size() == bounds.size() + 1;
     for (size_t i = 0; ok && i < bounds.size(); ++i)
         ok = bounds[i] >= 1 && bounds[i] < g_.n_layers && (i == 0 || bounds[i] > bounds[i - 1]);
+    // STRATA_GLM_SPLIT_SAME_DEV=1 (tests): a split may name one device more than once - the split's paths (the
+    // hops, the pipelined window) checked on one GPU, a small model's parts side by side in its memory
+    static const bool same_dev = getenv("STRATA_GLM_SPLIT_SAME_DEV") != nullptr;
     for (size_t i = 0; ok && i < devs.size(); ++i) {
         ok = devs[i] >= 0 && devs[i] < n_dev;
-        for (size_t j = 0; ok && j < i; ++j) ok = devs[i] != devs[j];
+        for (size_t j = 0; ok && j < i && !same_dev; ++j) ok = devs[i] != devs[j];
     }
     if (!ok) {
         err = "glm split: " + std::to_string(bounds.size()) + " boundaries (rising, 1.." +
@@ -1969,6 +2281,7 @@ bool Glm5Model::forward_pipeline(const std::vector<int32_t>& tokens, std::vector
 }
 
 bool Glm5Model::step_layers(int64_t p, std::string& err) {
+    if (g_.arch == Glm5Geometry::Glm5Arch::Dsa) return step_layers_dsa(p, err);
     const Glm5Geometry& g = g_;
     float* const S = state_;
     float* const A = sc_;
@@ -2213,6 +2526,154 @@ bool Glm5Model::step_layers(int64_t p, std::string& err) {
                                            g.norm_eps);
         GM_CHECK(gm_gemv(ws_map_.at("output.weight"), A + sc_head, nullptr, 1.0f,
                                      A + sc_logits, g.n_vocab, g.n_embd), err);
+    }
+    return true;
+}
+
+// The glm-dsa reference step (docs/GLM53-ENGINE-PORT.md P2): llama.cpp's glm-dsa.cpp graph, one token at a
+// time, correctness first.  What differs from the Flash step above:
+//   - a plain residual (h += attn; h += ffn): no mHC, so R is ONE stream and hc = 1;
+//   - every layer is MLA + DSA (no KDA); the MLA keeps a RoPE tail: q = [nope | rope] per head, kv_a gives
+//     [latent | k_rope], the cache row is lat_row = kv_lora + qk_rope, scale 1/sqrt(qk_nope + qk_rope);
+//   - the indexer selects TOKENS (no k-pool): iq/ik rotated on their first qk_rope features, scored over
+//     every visible key, top idx_top_k; a "shared" layer reuses the selection of the previous full layer;
+//   - the SwiGLU is unclamped (the geometry's limits are +inf).
+bool Glm5Model::step_layers_dsa(int64_t p, std::string& err) {
+    const Glm5Geometry& g = g_;
+    float* const S = state_;
+    float* const A = sc_;
+    float* const R = S;   // the one residual stream
+    const float prescale = 1.0f / std::sqrt((float) (g.idx_key * g.idx_heads));
+    const int q_stride = g.qk_nope + g.qk_rope;
+    const int lat_row = g.lat_row();
+    const float scale = 1.0f / std::sqrt((float) q_stride);
+    int n_sel = 0;   // the last full-indexer layer's selection (A + sc_cells), which shared layers reuse
+    const int p32 = (int) p;
+    GM_CHECK(cudaMemcpy(d_pos_, &p32, sizeof(int), cudaMemcpyHostToDevice), err);
+
+    for (int il = l0_; il < l1_; ++il) {
+        const std::string L = std::to_string(il);
+        const auto W = [&](const char* suffix) { return w_.at("blk." + L + "." + suffix); };
+        const auto ws_ = [&](const std::string& suffix) -> WSlot& { return ws_map_.at("blk." + L + "." + suffix); };
+
+        rms_norm_kernel<<<1, GM_THREADS>>>(R, W("attn_norm.weight"), A + sc_x, g.n_embd, 1, g.norm_eps);
+        cb_dump("attn_norm-" + L, A + sc_x, g.n_embd);
+        GM_CHECK(gm_gemv(ws_("attn_q_a.weight"), A + sc_x, nullptr, 1.0f, A + sc_qr, g.q_lora, g.n_embd), err);
+        rms_norm_kernel<<<1, GM_THREADS>>>(A + sc_qr, W("attn_q_a_norm.weight"), A + sc_qr, g.q_lora, 1, g.norm_eps);
+
+        // ---- the lightning indexer (full layers only): its keys go into this layer's key cache
+        if (g.indexer_full[(size_t) il]) {
+            GM_CHECK(gm_gemv(ws_("indexer.attn_q_b.weight"), A + sc_qr, nullptr, 1.0f, A + sc_iq,
+                             (int64_t) g.idx_heads * g.idx_key, g.q_lora), err);
+            rope_norm_kernel<<<blocks(g.idx_heads * (g.qk_rope / 2)), GM_THREADS>>>(
+                A + sc_iq, g.idx_heads, g.idx_key, 0, g.qk_rope, (long long) p, g.rope_base);
+            float* ik = S + dsa_ik_[(size_t) il];
+            GM_CHECK(gm_gemv(ws_("indexer.attn_k.weight"), A + sc_x, nullptr, 1.0f, A + sc_tmp, g.idx_key,
+                             g.n_embd), err);
+            layer_norm_kernel<<<1, GM_THREADS>>>(A + sc_tmp, W("indexer.k_norm.weight"), W("indexer.k_norm.bias"),
+                                                 A + sc_tmp, g.idx_key, 1, g.norm_eps);
+            rope_norm_kernel<<<blocks(g.qk_rope / 2), GM_THREADS>>>(A + sc_tmp, 1, g.idx_key, 0, g.qk_rope,
+                                                                    (long long) p, g.rope_base);
+            GM_CHECK(cudaMemcpy(ik + (int64_t) g.idx_key * p, A + sc_tmp, (size_t) g.idx_key * sizeof(float),
+                                cudaMemcpyDeviceToDevice), err);
+            GM_CHECK(gm_gemv(ws_("indexer.proj.weight"), A + sc_x, nullptr, prescale, A + sc_iw, g.idx_heads,
+                             g.n_embd), err);
+            // every key 0..p is a one-token "pool" (kpool 1): score them all, keep the top idx_top_k
+            const int n_keys = (int) p + 1;
+            n_sel = std::min(g.idx_top_k, n_keys);
+            strata::kernels::glm_dsa_score(A + sc_iq, ik, A + sc_iw, g.idx_key, g.idx_heads, 1, n_keys,
+                                           A + sc_score, nullptr);
+            strata::kernels::glm_dsa_select(A + sc_score, n_keys, 1, n_sel, 0, 1, n_sel, d_pos_,
+                                            (int*) (A + sc_cells), nullptr);
+        } else if (n_sel == 0) {
+            err = "glm5_model: glm-dsa layer " + L + " shares an indexer but no full layer ran before it";
+            return false;
+        }
+
+        // ---- MLA with the RoPE tail
+        GM_CHECK(gm_gemv(ws_("attn_q_b.weight"), A + sc_qr, nullptr, 1.0f, A + sc_q, (int64_t) g.n_head * q_stride,
+                         g.q_lora), err);
+        rope_norm_kernel<<<blocks(g.n_head * (g.qk_rope / 2)), GM_THREADS>>>(A + sc_q, g.n_head, q_stride, g.qk_nope,
+                                                                            g.qk_rope, (long long) p, g.rope_base);
+        GM_CHECK(gm_gemv(ws_("attn_kv_a_mqa.weight"), A + sc_x, nullptr, 1.0f, A + sc_kv, lat_row, g.n_embd), err);
+        rms_norm_kernel<<<1, GM_THREADS>>>(A + sc_kv, W("attn_kv_a_norm.weight"), A + sc_kv, g.kv_lora, 1,
+                                           g.norm_eps);   // the latent only; the k_rope tail is rotated, not normed
+        rope_norm_kernel<<<blocks(g.qk_rope / 2), GM_THREADS>>>(A + sc_kv, 1, lat_row, g.kv_lora, g.qk_rope,
+                                                                (long long) p, g.rope_base);
+        float* lat = S + dsa_lat_[(size_t) il];
+        GM_CHECK(cudaMemcpy(lat + (int64_t) lat_row * p, A + sc_kv, (size_t) lat_row * sizeof(float),
+                            cudaMemcpyDeviceToDevice), err);
+        q_absorb_strided_kernel<<<blocks(g.kv_lora * g.n_head), GM_THREADS>>>(
+            W("attn_k_b.weight"), A + sc_q, A + sc_qabs, g.qk_nope, q_stride, g.kv_lora, g.n_head);
+        mla_rope_attention_kernel<<<g.n_head, GM_THREADS, (size_t) (n_sel + g.kv_lora) * sizeof(float)>>>(
+            A + sc_qabs, A + sc_q, q_stride, g.qk_nope, g.qk_rope, lat, lat_row, g.kv_lora,
+            (const int*) (A + sc_cells), n_sel, W("attn_v_b.weight"), g.v_head, scale, A + sc_attn);
+        GM_CHECK(cudaGetLastError(), err);
+        GM_CHECK(gm_gemv(ws_("attn_output.weight"), A + sc_attn, nullptr, 1.0f, A + sc_mixer, g.n_embd,
+                         (int64_t) g.n_head * g.v_head), err);
+        add_kernel<<<blocks(g.n_embd), GM_THREADS>>>(R, A + sc_mixer, R, g.n_embd);
+        cb_dump("attn_out-" + L, A + sc_mixer, g.n_embd);
+
+        // ---- the FFN half (the Flash step's arithmetic, unclamped through the +inf limits)
+        rms_norm_kernel<<<1, GM_THREADS>>>(R, W("ffn_norm.weight"), A + sc_x, g.n_embd, 1, g.norm_eps);
+        cb_dump("ffn_norm-" + L, A + sc_x, g.n_embd);
+        if (il < g.dense_lead) {
+            GM_CHECK(gm_gemv(ws_("ffn_gate.weight"), A + sc_x, nullptr, 1.0f, A + sc_gate, g.n_ff_dense, g.n_embd), err);
+            GM_CHECK(gm_gemv(ws_("ffn_up.weight"), A + sc_x, nullptr, 1.0f, A + sc_up, g.n_ff_dense, g.n_embd), err);
+            strata::kernels::glm_swiglu_clamp(A + sc_gate, A + sc_up, g.swiglu_shexp, g.n_ff_dense, A + sc_h, nullptr);
+            GM_CHECK(gm_gemv(ws_("ffn_down.weight"), A + sc_h, nullptr, 1.0f, A + sc_ffn, g.n_embd, g.n_ff_dense), err);
+        } else {
+            GM_CHECK(gm_gemv(ws_("ffn_gate_inp.weight"), A + sc_x, nullptr, 1.0f, A + sc_tmp, g.n_expert, g.n_embd), err);
+            strata::kernels::router_sigmoid(A + sc_tmp, W("exp_probs_b.bias"), 1, g.n_expert, g.n_exp_used,
+                                            g.w_scale, g.norm_w != 0, (int*) (A + sc_ids), A + sc_rw, nullptr);
+            cb_dump("glm_moe_topk-" + L, A + sc_ids, g.n_exp_used);
+            std::vector<int> ids((size_t) g.n_exp_used);
+            std::vector<float> rw((size_t) g.n_exp_used);
+            GM_CHECK(cudaMemcpy(ids.data(), A + sc_ids, ids.size() * sizeof(int), cudaMemcpyDeviceToHost), err);
+            GM_CHECK(cudaMemcpy(rw.data(), A + sc_rw, rw.size() * sizeof(float), cudaMemcpyDeviceToHost), err);
+            GM_CHECK(cudaMemset(A + sc_moe, 0, (size_t) g.n_embd * sizeof(float)), err);
+            const int64_t slab = (int64_t) g.n_embd * g.n_ff_exp;
+            if (pack_) {
+                if (dev_experts_) {
+                    if (!pack_moe_tail_device(err, ids, rw, A, il)) return false;
+                } else {
+                    GM_CHECK(pack_moe_tail(err, ids, rw, A, il), err);
+                }
+            } else {
+                for (int i = 0; i < g.n_exp_used; ++i) {
+                    const int e = ids[(size_t) i];
+                    gemv_bias_kernel<<<gm_blocks(g.n_ff_exp), GM_THREADS>>>(W("ffn_gate_exps.weight") + slab * e,
+                                                                         A + sc_x, nullptr, 1.0f, A + sc_gate,
+                                                                         g.n_ff_exp, g.n_embd, 1);
+                    gemv_bias_kernel<<<gm_blocks(g.n_ff_exp), GM_THREADS>>>(W("ffn_up_exps.weight") + slab * e,
+                                                                         A + sc_x, nullptr, 1.0f, A + sc_up,
+                                                                         g.n_ff_exp, g.n_embd, 1);
+                    strata::kernels::glm_swiglu_clamp(A + sc_gate, A + sc_up, g.swiglu_exp, g.n_ff_exp, A + sc_h,
+                                                      nullptr);
+                    gemv_bias_kernel<<<gm_blocks(g.n_embd), GM_THREADS>>>(W("ffn_down_exps.weight") + slab * e,
+                                                                       A + sc_h, nullptr, 1.0f, A + sc_dn, g.n_embd,
+                                                                       g.n_ff_exp, 1);
+                    axpy_kernel<<<blocks(g.n_embd), GM_THREADS>>>(A + sc_moe, rw[(size_t) i], A + sc_dn, g.n_embd);
+                }
+            }
+            GM_CHECK(gm_gemv(ws_("ffn_gate_shexp.weight"), A + sc_x, nullptr, 1.0f, A + sc_gate,
+                             (int64_t) g.n_ff_exp * g.n_shared, g.n_embd), err);
+            GM_CHECK(gm_gemv(ws_("ffn_up_shexp.weight"), A + sc_x, nullptr, 1.0f, A + sc_up,
+                             (int64_t) g.n_ff_exp * g.n_shared, g.n_embd), err);
+            strata::kernels::glm_swiglu_clamp(A + sc_gate, A + sc_up, g.swiglu_shexp, (int64_t) g.n_ff_exp * g.n_shared,
+                                              A + sc_h, nullptr);
+            GM_CHECK(gm_gemv(ws_("ffn_down_shexp.weight"), A + sc_h, nullptr, 1.0f, A + sc_sh, g.n_embd,
+                             (int64_t) g.n_ff_exp * g.n_shared), err);
+            add_kernel<<<blocks(g.n_embd), GM_THREADS>>>(A + sc_moe, A + sc_sh, A + sc_ffn, g.n_embd);
+        }
+        add_kernel<<<blocks(g.n_embd), GM_THREADS>>>(R, A + sc_ffn, R, g.n_embd);
+        cb_dump("l_out-" + L, R, g.n_embd);
+    }
+
+    if (l1_ == g.n_layers) {
+        rms_norm_kernel<<<1, GM_THREADS>>>(R, w_.at("output_norm.weight"), A + sc_head, g.n_embd, 1, g.norm_eps);
+        GM_CHECK(gm_gemv(ws_map_.at("output.weight"), A + sc_head, nullptr, 1.0f, A + sc_logits, g.n_vocab, g.n_embd),
+                 err);
     }
     return true;
 }
@@ -2598,6 +3059,7 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
     const std::string dir2 = pack_dir + "/..";   // the shards live beside the pack directory
     strata::GgufFile gguf(dir2 + "/" + shard_names[0]);
     if (!Glm5Geometry::from_gguf(gguf, g_, err)) return false;
+    if (!dsa_forward_guard(g_, err)) return false;   // same gate as load(): no Dsa forward before P2
     max_ctx_ = max_ctx;
     l0_ = l0;
     l1_ = l1 > 0 ? l1 : g_.n_layers;
@@ -2803,8 +3265,17 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
         err = "pack: an EXL3 model runs on the fast path only (unset STRATA_GLM_SLOW)";
         return false;
     }
+    const auto ends = [](const std::string& n, const char* suf) {
+        const size_t k = std::strlen(suf);
+        return n.size() >= k && n.compare(n.size() - k, k, suf) == 0;
+    };
     const auto keep16 = [&](const Row& r, const strata::TensorInfo* t) {
-        return fast_mode_ && r.kind == "4" && t->elements() >= 65536;
+        // (glm-dsa: the router and the indexer's head weights are BF16 for the token path whatever their size - a
+        // small model's fall under the 65536 floor, a real one's do not)
+        return fast_mode_ && r.kind == "4" &&
+               (t->elements() >= 65536 ||
+                (g_.arch == Glm5Geometry::Glm5Arch::Dsa &&
+                 (ends(r.name, "ffn_gate_inp.weight") || ends(r.name, "indexer.proj.weight"))));
     };
     const auto skip_upload = [&](const Row& r) { return fast_mode_ && r.name == "token_embd.weight"; };
     uint64_t bytes = 0;
@@ -3051,7 +3522,8 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
         (l0_ > 0 || getenv("STRATA_GLM_MTP") != nullptr || mtp_one)) {   // any split: the speculative decode, 2+ parts
         if (!load_mtp(gfs, err)) return false;
         if (mtp_il_ >= 0) lt_ = l1_ + 1;
-        if (mtp_il_ >= 0 && mtp_one) mtp_vocab_scan(gfs);   // the draft head's vocabulary
+        if (mtp_il_ >= 0 && (mtp_one || (n_parts_ > 1 && mtp_pipe_wanted())))
+            mtp_vocab_scan(gfs);   // the draft head's vocabulary (the one-GPU or the pipelined MTP decode)
     }
 
     // 5. the router bias, host-side: the prefetch ranks the next-best experts per layer, and the
@@ -3070,16 +3542,17 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
     int64_t floats = 2 * hc_dim;
     // the fast path keeps the DSA latent cache in FP16 (half the bytes: at 128k context ~0.8 GB more for experts on
     // each card, and the prompt attention reads half as much); the reference path (STRATA_GLM_SLOW) keeps F32
-    lat_q8_ = fast_mode_ && g_.kv_lora % 32 == 0 && getenv("STRATA_GLM_KV_INT8") != nullptr &&
-              std::atoi(getenv("STRATA_GLM_KV_INT8")) != 0;
+    const bool dsa53 = g_.arch == Glm5Geometry::Glm5Arch::Dsa;
+    lat_q8_ = fast_mode_ && !dsa53 && g_.kv_lora % 32 == 0 && getenv("STRATA_GLM_KV_INT8") != nullptr &&
+              std::atoi(getenv("STRATA_GLM_KV_INT8")) != 0;   // (glm-dsa: FP16 rows until its INT8 record, P7)
     // KV streaming (--kv-resident N): the latent cache lives in pinned RAM and the state holds N positions of VRAM slots
     // a layer (kv_stream_setup, below)
-    const int64_t kv_cells = fast_mode_ ? kv_resident_cells(g_.idx_kpool, max_ctx) : 0;
+    const int64_t kv_cells = fast_mode_ && !dsa53 ? kv_resident_cells(g_.idx_kpool, max_ctx) : 0;   // (glm-dsa: P7)
     const int64_t lat_rows = kv_cells > 0 ? kv_cells : max_ctx;
     // (INT8: lat8_rec_bytes per position, a multiple of 16 bytes at kv_lora 512)
     const int64_t lat_floats = lat_q8_      ? (int64_t) strata::kernels::glmf::lat8_rec_bytes(g_.kv_lora) / 4 * lat_rows
-                               : fast_mode_ ? (int64_t) g_.kv_lora * lat_rows / 2
-                                            : (int64_t) g_.kv_lora * lat_rows;
+                               : fast_mode_ ? (int64_t) g_.lat_row() * lat_rows / 2
+                                            : (int64_t) g_.lat_row() * lat_rows;   // (Flash: lat_row = kv_lora)
     if (lat_q8_) std::fprintf(stderr, "glm pack: CUDA%d latent cache INT8 (%d bytes a position and layer)\n", dev_,
                               strata::kernels::glmf::lat8_rec_bytes(g_.kv_lora));
     // (one entry past the trunk: the NextN block's DSA caches, when this half carries it)
@@ -3092,6 +3565,7 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
     // the indexer key / gate caches: a ring on the fast path (the prompt path's largest sub-batch + 64 positions; see
     // ik_ring_), the whole context on the reference path (whose kernels index them by position)
     ik_ring_ = fast_mode_ ? (int) std::min<int64_t>(max_ctx, 8192 + 64) : (int) max_ctx;
+    if (dsa53) ik_ring_ = (int) max_ctx;   // glm-dsa: no pool to fold the keys into - the indexer reads every one
     if (mtp_il_ >= 0) {
         dsa_lat_[(size_t) mtp_il_] = floats;
         floats += lat_floats;
@@ -3109,6 +3583,14 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
             floats += (int64_t) g_.d_inner() * g_.kda_head_dim;
             kda_conv_[(size_t) il] = floats;
             floats += (int64_t) 3 * g_.d_inner() * (g_.d_conv - 1);
+        } else if (dsa53) {
+            // glm-dsa: the cache rows (latent + k_rope); keys only where the layer runs its own indexer; no pool
+            dsa_lat_[(size_t) il] = floats;
+            floats += lat_floats;
+            if (g_.indexer_full[(size_t) il]) {
+                dsa_ik_[(size_t) il] = floats;
+                floats += (int64_t) g_.idx_key * ik_ring_;
+            }
         } else {
             dsa_lat_[(size_t) il] = floats;
             floats += lat_floats;
@@ -3151,8 +3633,8 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
     sc_g2 = take(g_.d_inner());
     sc_gated = take(g_.d_inner());
     sc_qr = take(g_.q_lora);
-    sc_kv = take(g_.kv_lora);
-    sc_q = take((int64_t) g_.n_head * g_.qk_nope);
+    sc_kv = take(g_.lat_row());                                  // (glm-dsa: kv_a's latent + RoPE tail)
+    sc_q = take((int64_t) g_.n_head * (g_.qk_nope + g_.qk_rope));   // (Flash: qk_rope 0, unchanged)
     sc_qabs = take((int64_t) g_.kv_lora * g_.n_head);
     sc_iq = take((int64_t) g_.idx_heads * g_.idx_key);
     sc_iw = take(g_.idx_heads);
@@ -3360,6 +3842,7 @@ bool strata::core::Glm5Model::load_mtp(const std::vector<std::unique_ptr<strata:
     }
     const auto x3 = [&](const std::string& n) { return exl3_ && xt.mats.count(n) != 0; };
     const auto& raw_names = kMtpRaw;
+    const bool dsa53 = g_.arch == Glm5Geometry::Glm5Arch::Dsa;
     const auto& b16_names = kMtpB16;
     const auto& f32_names = kMtpF32;
     uint64_t bytes = 0;
@@ -3369,17 +3852,20 @@ bool strata::core::Glm5Model::load_mtp(const std::vector<std::unique_ptr<strata:
             bytes += xt.mats.at(P + n).vram();
         }
         for (const char* n : b16_names) {
+            if (mtp_absent_ok(n, dsa53)) continue;
             if (x3(P + n)) { bytes += xt.mats.at(P + n).vram(); continue; }
             const strata::TensorInfo* t = find(P + n, si);
             if (t == nullptr) { err = "mtp: " + P + n + " missing"; return false; }
             bytes += ((uint64_t) t->elements() * 2 + 255u) & ~(uint64_t) 255u;
         }
         for (const char* n : f32_names) {
+            if (mtp_absent_ok(n, dsa53)) continue;
             const strata::TensorInfo* t = find(P + n, si);
             if (t == nullptr) { err = "mtp: " + P + n + " missing"; return false; }
             bytes += ((uint64_t) t->elements() * 4 + 255u) & ~(uint64_t) 255u;
         }
-    } else if (!mtp_dense_vram([&](const std::string& n) { return find(n, si); }, il, bytes, err)) {
+    } else if (!mtp_dense_vram([&](const std::string& n) { return find(n, si); }, il, bytes, err,
+                               g_.arch == Glm5Geometry::Glm5Arch::Dsa)) {
         return false;
     }
     if (cudaMalloc(&mtp_arena_, bytes) != cudaSuccess) {
@@ -3445,6 +3931,7 @@ bool strata::core::Glm5Model::load_mtp(const std::vector<std::unique_ptr<strata:
     }
     std::vector<uint16_t> b16;
     for (const char* n : b16_names) {
+        if (mtp_absent_ok(n, dsa53)) continue;
         if (x3(P + n)) {   // (an EXL3 pack quantizes the indexer's q_b: the fast path reads it from ws_map_)
             if (!up_x3(P + n)) return false;
             continue;
@@ -3463,6 +3950,7 @@ bool strata::core::Glm5Model::load_mtp(const std::vector<std::unique_ptr<strata:
         at += ((uint64_t) b16.size() * 2 + 255u) & ~(uint64_t) 255u;
     }
     for (const char* n : f32_names) {
+        if (mtp_absent_ok(n, dsa53)) continue;
         const strata::TensorInfo* t = find(P + n, si);
         if (!to_host(t, si)) return false;
         if (cudaMemcpy(base + at, host.data(), host.size() * 4, cudaMemcpyHostToDevice) != cudaSuccess) { err = "mtp: upload"; return false; }

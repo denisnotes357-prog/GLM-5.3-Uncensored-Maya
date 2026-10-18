@@ -1,0 +1,14 @@
+{"name": "Maya-G-M24",
+ "note": "Maya-G-M with the attention projections and the shared experts in Q4_K instead of Q6_K, as Maya-S24 did for Flash: GLM-5.3 reads ~15 GB of dense weights a token in Q6_K (attn_output alone 82 MB a layer) against ~8 GB of experts, so the dense bytes set the decode speed; attn_k_b / attn_v_b stay Q6_K/Q8_0 (the pack reads them as BF16). Experts as G-M: IQ2_S gate/up, IQ3_XXS down, IQ3_S down in layers 3-6 and 74-77; NextN Q3_K/Q4_K.",
+ "rules": [
+  {"match": "^blk\\.78\\.ffn_(gate|up)_exps", "type": "Q3_K"},
+  {"match": "^blk\\.78\\.ffn_down_exps", "type": "Q4_K"},
+  {"match": "ffn_(gate|up)_exps", "type": "IQ2_S"},
+  {"match": "^blk\\.([3-6]|7[4-7])\\.ffn_down_exps", "type": "IQ3_S"},
+  {"match": "ffn_down_exps", "type": "IQ3_XXS"},
+  {"match": "ffn_gate_inp|exp_probs_b|indexer\\.proj", "type": "F32"},
+  {"match": "indexer\\.", "type": "Q8_0"},
+  {"match": "^blk\\.\\d+\\.attn_(output|q_a|q_b|kv_a_mqa)\\.weight$", "type": "Q4_K"},
+  {"match": "^blk\\.\\d+\\.ffn_(gate|up|down)_shexp\\.weight$", "type": "Q4_K"}
+ ],
+ "default": "Q6_K"}

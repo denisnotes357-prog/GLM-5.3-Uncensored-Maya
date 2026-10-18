@@ -26,6 +26,8 @@
 #include <algorithm>
 #include <atomic>
 #include <cstdio>
+#include <mutex>
+#include <unordered_map>
 #include <cstdlib>
 
 #if defined(STRATA_USE_HIP)
@@ -2304,9 +2306,9 @@ __global__ void head_prep_kernel(const float* __restrict__ R, const float* __res
     }
 }
 
-__global__ void embed_streams_kernel(const float* __restrict__ emb, float* __restrict__ R, int n_embd) {
+__global__ void embed_streams_kernel(const float* __restrict__ emb, float* __restrict__ R, int n_embd, int hc) {
     const int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= 4 * n_embd) return;
+    if (idx >= hc * n_embd) return;
     R[idx] = emb[idx % n_embd];
 }
 
@@ -2545,10 +2547,140 @@ __global__ void __launch_bounds__(1024) dsa_select_kernel(const float* __restric
                                                           int top_pools, int n_sel, int pos, int* __restrict__ cells) {
     for (int i = threadIdx.x; i < n_sel; i += blockDim.x) cells[i] = -1;
     __syncthreads();
-    // the top pools in rank order (score descending, ties by the lower index), O(n_vis) - src/kernels/cuda/dsa_topk.cuh
+    // the top pools in ascending pool order (ties by the lower index), O(n_vis) - src/kernels/cuda/dsa_topk.cuh
     if (n_vis > 0) strata::kernels::dsa::select_top_pools(score, n_vis, min(top_pools, n_vis), kpool, cells);
     __syncthreads();
     if (threadIdx.x == 0) {
+        for (int m = 0; m < kpool - 1; ++m) {
+            const int cell = n_vis * kpool + m;
+            if (cell <= pos) cells[top_pools * kpool + m] = cell;
+        }
+    }
+}
+
+// The same selection by several blocks, for a long context: one block reads all n_vis scores five times (four radix
+// passes and the collection), 330 us a call at 256K on an RTX 3090 (x21 full layers of glm-dsa: 6.9 ms a token).
+// Each block takes a contiguous run of `chunk` pools.  A radix pass is one launch: every block adds its histogram of
+// the keys still in the running to the pass's global one, and the last block to finish (a counter, as in the CUDA
+// threadFenceReduction sample) picks the byte and writes the prefix and the remaining need for the next pass.  Then
+// every block counts its keys above and equal to the cut-off, and the last launch writes each block's winners in pool
+// order at the offset the earlier blocks' counts give - the cells select_top_pools writes, bit for bit.
+// The workspace (kSelWsBytes, the caller's own per stream; hist and done zeroed before each selection):
+namespace dsasel {
+constexpr int kThreads = 256, kBlocks = 128;
+constexpr int kHist = 0;                        // 4 passes x 256 bins
+constexpr int kDone = 1024;                     // 4 passes' finished-block counters
+constexpr int kZeroed = 1028;                   // [0, kZeroed) is cleared before each selection
+constexpr int kPrefix = 1032, kNeed = 1040;     // [pass]: the state a pass starts from; [4]: the cut-off and its need
+constexpr int kGt = 1048, kEq = kGt + kBlocks;  // per block: keys above / equal to the cut-off
+static_assert((kEq + kBlocks) * sizeof(unsigned) <= kSelWsBytes, "dsa_select workspace");
+}  // namespace dsasel
+
+__global__ void __launch_bounds__(dsasel::kThreads) dsa_sel_hist_kernel(const float* __restrict__ score, int n_vis,
+                                                                        int top, int chunk, unsigned* __restrict__ ws,
+                                                                        int pass) {
+    using namespace dsasel;
+    __shared__ unsigned s_h[256];
+    __shared__ bool s_last;
+    const int t = threadIdx.x, shift = 24 - 8 * pass;
+    const unsigned prefix = pass ? ws[kPrefix + pass] : 0u;
+    const unsigned mask = pass ? 0xffffffffu << (32 - 8 * pass) : 0u;
+    s_h[t] = 0u;
+    __syncthreads();
+    const int lo = min(n_vis, (int) blockIdx.x * chunk), hi = min(n_vis, lo + chunk);
+    for (int i = lo + t; i < hi; i += kThreads) {
+        const unsigned k = strata::kernels::dsa::score_key(score[i]);
+        if ((k & mask) == prefix) atomicAdd(&s_h[(k >> shift) & 255u], 1u);
+    }
+    __syncthreads();
+    unsigned* gh = ws + kHist + pass * 256;
+    if (s_h[t] != 0u) atomicAdd(&gh[t], s_h[t]);
+    __threadfence();
+    __syncthreads();
+    if (t == 0) s_last = atomicAdd(&ws[kDone + pass], 1u) == gridDim.x - 1;
+    __syncthreads();
+    if (!s_last) return;
+    __threadfence();
+    s_h[t] = ((volatile unsigned*) gh)[t];   // the whole histogram, every block's adds visible
+    __syncthreads();
+    if (t == 0) {
+        int need = pass ? (int) ws[kNeed + pass] : top;
+        for (int b = 255; b >= 0; --b) {
+            const int c = (int) s_h[b];
+            if (c >= need) {
+                ws[kPrefix + pass + 1] = prefix | ((unsigned) b << shift);
+                ws[kNeed + pass + 1] = (unsigned) need;
+                break;
+            }
+            need -= c;
+        }
+    }
+}
+
+__global__ void __launch_bounds__(dsasel::kThreads) dsa_sel_count_kernel(const float* __restrict__ score, int n_vis,
+                                                                         int chunk, unsigned* __restrict__ ws) {
+    using namespace dsasel;
+    __shared__ int s_warp[kThreads / 32];
+    const unsigned cut = ws[kPrefix + 4];
+    const int lo = min(n_vis, (int) blockIdx.x * chunk), hi = min(n_vis, lo + chunk);
+    int gt = 0, eq = 0;
+    for (int i = lo + (int) threadIdx.x; i < hi; i += kThreads) {
+        const unsigned k = strata::kernels::dsa::score_key(score[i]);
+        gt += k > cut;
+        eq += k == cut;
+    }
+    int tg = 0, te = 0;
+    strata::kernels::dsa::block_excl_scan<kThreads>(gt, s_warp, tg);
+    strata::kernels::dsa::block_excl_scan<kThreads>(eq, s_warp, te);
+    if (threadIdx.x == 0) {
+        ws[kGt + blockIdx.x] = (unsigned) tg;
+        ws[kEq + blockIdx.x] = (unsigned) te;
+    }
+}
+
+__global__ void __launch_bounds__(dsasel::kThreads) dsa_sel_write_kernel(const float* __restrict__ score, int n_vis,
+                                                                         int chunk, int kpool, int top_pools, int n_sel,
+                                                                         int pos, const unsigned* __restrict__ ws,
+                                                                         int* __restrict__ cells) {
+    using namespace dsasel;
+    __shared__ int s_warp[kThreads / 32];
+    __shared__ int s_gt[kBlocks], s_eq[kBlocks];
+    __shared__ int s_e0, s_o0;
+    const int t = threadIdx.x, b = blockIdx.x;
+    const unsigned cut = ws[kPrefix + 4];
+    const int need_eq = (int) ws[kNeed + 4];
+    if (t < b) {
+        s_gt[t] = (int) ws[kGt + t];
+        s_eq[t] = (int) ws[kEq + t];
+    }
+    __syncthreads();
+    if (t == 0) {   // the earlier blocks' winners, and how many of the keys equal to the cut-off they took
+        int e = 0, o = 0;
+        for (int j = 0; j < b; ++j) {
+            o += s_gt[j] + max(0, min(s_eq[j], need_eq - e));
+            e += s_eq[j];
+        }
+        s_e0 = e;
+        s_o0 = o;
+    }
+    __syncthreads();
+    int e = s_e0, o = s_o0;
+    const int lo = min(n_vis, b * chunk), hi = min(n_vis, lo + chunk);
+    for (int base = lo; base < hi; base += kThreads) {   // a tile of kThreads pools, in order
+        const int i = base + t;
+        const unsigned k = i < hi ? strata::kernels::dsa::score_key(score[i]) : 0u;
+        const int is_eq = i < hi && k == cut, is_gt = i < hi && k > cut;
+        int te = 0, tw = 0;
+        const int eb = strata::kernels::dsa::block_excl_scan<kThreads>(is_eq, s_warp, te);
+        const int win = is_gt || (is_eq && e + eb < need_eq);
+        const int ob = strata::kernels::dsa::block_excl_scan<kThreads>(win, s_warp, tw);
+        if (win)
+            for (int m = 0; m < kpool; ++m) cells[(o + ob) * kpool + m] = i * kpool + m;
+        e += te;
+        o += tw;
+    }
+    if (b == 0 && t == 0) {   // the cells past the selection, then the tail - as dsa_select_kernel leaves them
+        for (int i = min(top_pools, n_vis) * kpool; i < n_sel; ++i) cells[i] = -1;
         for (int m = 0; m < kpool - 1; ++m) {
             const int cell = n_vis * kpool + m;
             if (cell <= pos) cells[top_pools * kpool + m] = cell;
@@ -3843,16 +3975,17 @@ __global__ void embed_tok_kernel(const void* __restrict__ table, int type, int n
     out[e] = __half2float(b->d) * (float) sc[is + 2 * quarter] * (float) (int8_t) (q - 32);
 }
 
-// cat = [rms(emb) * enorm, rms(h) * hnorm] as q8_1 (eh_proj's input); n_embd <= 4096, one block of 1024
+// cat = [rms(emb) * enorm, rms(h) * hnorm] as q8_1 (eh_proj's input); n_embd <= 8192, one block of 1024 (glm-dsa's
+// 6144 too - at n <= 4096 the iterations past the fourth add +0.0 to the sums: Flash's result bit for bit)
 __global__ void __launch_bounds__(1024) mtp_in_kernel(const float* __restrict__ emb, const float* __restrict__ h,
                                                       const float* __restrict__ enorm, const float* __restrict__ hnorm,
                                                       float eps, int n, block_q8_1* __restrict__ catq) {
     __shared__ float sred[32];
     const int tid = threadIdx.x, lane = tid & 31;
-    float a[4], b[4];
+    float a[8], b[8];
     float sa = 0.0f, sb = 0.0f;
 #pragma unroll
-    for (int i = 0; i < 4; ++i) {
+    for (int i = 0; i < 8; ++i) {
         const int e = tid + 1024 * i;
         a[i] = e < n ? emb[e] : 0.0f;
         b[i] = e < n ? h[e] : 0.0f;
@@ -3863,23 +3996,24 @@ __global__ void __launch_bounds__(1024) mtp_in_kernel(const float* __restrict__ 
     sb = block_sum(sb, sred);
     const float ia = rsqrtf(sa / (float) n + eps), ib = rsqrtf(sb / (float) n + eps);
 #pragma unroll
-    for (int i = 0; i < 4; ++i) {
+    for (int i = 0; i < 8; ++i) {
         const int e = tid + 1024 * i;
         if (e >= n) break;
         q8_1_store_warp(a[i] * ia * enorm[e], catq + e / 32, lane);
         q8_1_store_warp(b[i] * ib * hnorm[e], catq + (n + e) / 32, lane);
     }
 }
-// h += add (when given), then x = rms(h) * w and its q8_1; n_embd <= 4096, one block of 1024
+// h += add (when given), then x = rms(h) * w and its q8_1; n_embd <= 8192, one block of 1024 (as mtp_in: Flash's 4096
+// unchanged bit for bit)
 __global__ void __launch_bounds__(1024) rms_q8_kernel(float* __restrict__ h, const float* __restrict__ add,
                                                       const float* __restrict__ w, float eps, int n,
                                                       float* __restrict__ x, block_q8_1* __restrict__ xq) {
     __shared__ float sred[32];
     const int tid = threadIdx.x, lane = tid & 31;
-    float v[4];
+    float v[8];
     float ss = 0.0f;
 #pragma unroll
-    for (int i = 0; i < 4; ++i) {
+    for (int i = 0; i < 8; ++i) {
         const int e = tid + 1024 * i;
         float t = e < n ? h[e] : 0.0f;
         if (add != nullptr && e < n) {
@@ -3892,7 +4026,7 @@ __global__ void __launch_bounds__(1024) rms_q8_kernel(float* __restrict__ h, con
     ss = block_sum(ss, sred);
     const float inv = rsqrtf(ss / (float) n + eps);
 #pragma unroll
-    for (int i = 0; i < 4; ++i) {
+    for (int i = 0; i < 8; ++i) {
         const int e = tid + 1024 * i;
         if (e >= n) break;
         const float xv = v[i] * inv * w[e];
@@ -4464,13 +4598,18 @@ void hc_post(const float* block_out, const float* R_old, const float* post, cons
     launch_check("hc_post");
 }
 
-void head_prep(const float* R, const float* norm_w, float eps, int n_embd, float* x, void* xq, cudaStream_t s) {
+void head_prep(const float* R, const float* norm_w, float eps, int n_embd, float* x, void* xq, cudaStream_t s, int hc) {
+    if (hc == 1) {   // glm-dsa's one stream: the mean is the stream itself - rms_q8 (n_embd up to 8192)
+        rms_q8_kernel<<<1, 1024, 0, s>>>(const_cast<float*>(R), nullptr, norm_w, eps, n_embd, x, (block_q8_1*) xq);
+        launch_check("head_prep");
+        return;
+    }
     head_prep_kernel<<<1, 1024, 0, s>>>(R, norm_w, eps, n_embd, x, (block_q8_1*) xq);
     launch_check("head_prep");
 }
 
-void embed_streams(const float* emb, float* R, int n_embd, cudaStream_t s) {
-    embed_streams_kernel<<<(4 * n_embd + 255) / 256, 256, 0, s>>>(emb, R, n_embd);
+void embed_streams(const float* emb, float* R, int n_embd, cudaStream_t s, int hc) {
+    embed_streams_kernel<<<(hc * n_embd + 255) / 256, 256, 0, s>>>(emb, R, n_embd, hc);
     launch_check("embed_streams");
 }
 
@@ -4505,9 +4644,29 @@ void dsa_score(const float* iq, const float* pooled, const float* iw, int key_di
 }
 
 void dsa_select(const float* score, int n_vis, int kpool, int top_pools, int n_sel, int pos, int* cells,
-                cudaStream_t s) {
-    dsa_select_kernel<<<1, 1024, 0, s>>>(score, n_vis, kpool, top_pools, n_sel, pos, cells);
-    launch_check("dsa_select");
+                cudaStream_t s, void* ws) {
+    // from how many pools the selection takes several blocks (STRATA_GLM_SEL_MULTI; 0: always one block)
+    static const int multi_from = [] {
+        const char* v = getenv("STRATA_GLM_SEL_MULTI");
+        return v != nullptr && v[0] ? std::max(0, std::atoi(v)) : kSelMultiFrom;
+    }();
+    const int top = std::min(top_pools, n_vis);
+    if (ws == nullptr || multi_from == 0 || n_vis < multi_from || top < 1 || top >= n_vis) {
+        dsa_select_kernel<<<1, 1024, 0, s>>>(score, n_vis, kpool, top_pools, n_sel, pos, cells);
+        launch_check("dsa_select");
+        return;
+    }
+    // ~2048 pools a block, at most dsasel::kBlocks; the runs in whole tiles of the write kernel
+    int nb = std::min(dsasel::kBlocks, (n_vis + 2047) / 2048);
+    const int chunk = ((n_vis + nb - 1) / nb + dsasel::kThreads - 1) / dsasel::kThreads * dsasel::kThreads;
+    nb = (n_vis + chunk - 1) / chunk;
+    unsigned* w = (unsigned*) ws;
+    cudaMemsetAsync(w, 0, dsasel::kZeroed * sizeof(unsigned), s);
+    for (int pass = 0; pass < 4; ++pass)
+        dsa_sel_hist_kernel<<<nb, dsasel::kThreads, 0, s>>>(score, n_vis, top, chunk, w, pass);
+    dsa_sel_count_kernel<<<nb, dsasel::kThreads, 0, s>>>(score, n_vis, chunk, w);
+    dsa_sel_write_kernel<<<nb, dsasel::kThreads, 0, s>>>(score, n_vis, chunk, kpool, top_pools, n_sel, pos, w, cells);
+    launch_check("dsa_select (blocks)");
 }
 
 // the split attention of one token: q_abs (n_head x kv_lora) over its selected cells -> ctx; false when the split
@@ -5136,6 +5295,328 @@ void embed_tok(const void* table, int type, int n_rows, const int* tok, int n_em
 void argmax(const float* x, int n, int* out, cudaStream_t s, const int* map, int map_from) {
     argmax_kernel<<<1, 1024, 0, s>>>(x, n, out, map, map_from);
     launch_check("argmax");
+}
+
+
+// ================================================================================================================
+// glm-dsa (the full GLM-5.3, docs/GLM53-ENGINE-PORT.md P3): the token path's own DSA pieces.  Every layer is MLA +
+// DSA with a RoPE tail; the cache row is [latent kv_lora | k_rope qk_rope] in FP16; the indexer keeps a key per TOKEN
+// (no k-pool) on its full layers only.  The arithmetic follows step_layers_dsa (the reference step) - RoPE angles in
+// double, llama.cpp's NORM pairing (consecutive pairs).
+
+__device__ __forceinline__ void rope_pair(float& x0, float& x1, long long pos, int j, int n_rot, float base) {
+    const double theta = (double) pos * pow((double) base, -2.0 * j / n_rot);
+    const float c = (float) cos(theta), sn = (float) sin(theta);
+    const float a = x0, b = x1;
+    x0 = a * c - b * sn;
+    x1 = a * sn + b * c;
+}
+
+__global__ void rope_norm_kernel(float* __restrict__ x, int n_vec, int stride, int off, int n_rot, long long pos,
+                                 float base) {
+    const int half = n_rot / 2;
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n_vec * half) return;
+    const int v = idx / half, j = idx % half;
+    float* q = x + (size_t) v * stride + off + 2 * j;
+    rope_pair(q[0], q[1], pos, j, n_rot, base);
+}
+
+// block 0: q_a norm -> qr / qr_q (as dsa_prep); block 1: the latent's RMS norm and the rotated k_rope into the FP16 cache
+// row p; block 2 (full indexer layers): the indexer key's layer norm, rotated on its first qk_rope features, into ik[p]
+__global__ void __launch_bounds__(512) dsa53_prep_kernel(const __grid_constant__ Dsa53PrepArgs a) {
+    __shared__ float sred[32];
+    __shared__ float sk[512];
+    const int tid = threadIdx.x, lane = tid & 31;
+    if (blockIdx.x == 0) {
+        if (a.qr_raw == nullptr) return;   // the cache only (the NextN block's cache rows: mtp_cache_rows)
+        float vals[4];
+        float ss = 0.0f;
+        int n = 0;
+        for (int e = tid; e < a.q_lora; e += 512, ++n) {
+            vals[n] = a.qr_raw[e];
+            ss += vals[n] * vals[n];
+        }
+        ss = block_sum(ss, sred);
+        const float inv = rsqrtf(ss / (float) a.q_lora + a.eps);
+        n = 0;
+        for (int e = tid; e < a.q_lora; e += 512, ++n) {
+            const float y = vals[n] * inv * a.q_a_norm[e];
+            a.qr[e] = y;
+            q8_1_store_warp(y, (block_q8_1*) a.qr_q + e / 32, lane);
+        }
+        return;
+    }
+    if (blockIdx.x == 1) {
+        const int row = a.kv_lora + a.qk_rope;
+        uint16_t* dst = a.lat + (size_t) row * a.p;
+        const float v = tid < a.kv_lora ? a.kv_raw[tid] : 0.0f;
+        const float ss = block_sum(v * v, sred);
+        const float inv = rsqrtf(ss / (float) a.kv_lora + a.eps);
+        if (tid < a.kv_lora) dst[tid] = lat_h(v * inv * a.kv_norm[tid]);
+        if (tid < a.qk_rope / 2) {
+            float x0 = a.kv_raw[a.kv_lora + 2 * tid], x1 = a.kv_raw[a.kv_lora + 2 * tid + 1];
+            rope_pair(x0, x1, a.p, tid, a.qk_rope, a.rope_base);
+            dst[a.kv_lora + 2 * tid] = lat_h(x0);
+            dst[a.kv_lora + 2 * tid + 1] = lat_h(x1);
+        }
+        return;
+    }
+    if (a.ik_raw == nullptr) return;   // a shared-indexer layer keeps no key
+    const int K = a.idx_key;
+    const float v = tid < K ? a.ik_raw[tid] : 0.0f;
+    const float s1 = block_sum(v, sred);
+    const float s2 = block_sum(v * v, sred);
+    const float mu = s1 / (float) K;
+    const float inv = rsqrtf(s2 / (float) K - mu * mu + a.eps);
+    if (tid < K) sk[tid] = (v - mu) * inv * a.k_norm_w[tid] + a.k_norm_b[tid];
+    __syncthreads();
+    if (tid < a.qk_rope / 2) rope_pair(sk[2 * tid], sk[2 * tid + 1], a.p, tid, a.qk_rope, a.rope_base);
+    __syncthreads();
+    if (tid < K) a.ik_cache[(size_t) K * a.p + tid] = sk[tid];
+}
+
+// One block per head: q_abs = [wk_b_h . q_nope_h | q_rope_h] (kv_lora + qk_rope), scores against the selected cache rows
+// (the same length), softmax, ctx over the latent part, out_h = wv_b_h . ctx, q8_1 of out.  q's rope part is rotated.
+__global__ void __launch_bounds__(256) mla53_kernel(const float* __restrict__ q, const uint16_t* __restrict__ wk_b,
+                                                    const uint16_t* __restrict__ wv_b, const uint16_t* __restrict__ lat,
+                                                    const int* __restrict__ cells, int n_sel, int qk_nope, int qk_rope,
+                                                    int kv_lora, int v_head, block_q8_1* __restrict__ out) {
+    extern __shared__ float smem[];
+    const int row = kv_lora + qk_rope, qs = qk_nope + qk_rope;
+    float* s_q = smem;                    // qk_nope
+    float* s_qa = s_q + qk_nope;          // kv_lora + qk_rope
+    float* s_ctx = s_qa + row;            // kv_lora
+    float* s_out = s_ctx + kv_lora;       // v_head
+    float* s_p = s_out + v_head;          // n_sel
+    __shared__ float sred[32];
+    const int h = blockIdx.x, tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, nw = blockDim.x >> 5;
+    for (int i = tid; i < qk_nope; i += blockDim.x) s_q[i] = q[(size_t) qs * h + i];
+    for (int i = tid; i < qk_rope; i += blockDim.x) s_qa[kv_lora + i] = q[(size_t) qs * h + qk_nope + i];
+    __syncthreads();
+    const uint16_t* wk = wk_b + (size_t) qk_nope * kv_lora * h;
+    for (int c = warp; c < kv_lora; c += nw) {
+        const uint16_t* wr = wk + (size_t) qk_nope * c;
+        float acc = 0.0f;
+        for (int e = lane; e < qk_nope; e += 32) acc += bf(wr[e]) * s_q[e];
+        acc = warp_sum(acc);
+        if (lane == 0) s_qa[c] = acc;
+    }
+    __syncthreads();
+    const float scale = rsqrtf((float) qs);
+    for (int s = warp; s < n_sel; s += nw) {
+        const int cell = cells[s];
+        float dot = -INFINITY;
+        if (cell >= 0) {
+            const uint16_t* l = lat + (size_t) row * cell;
+            float acc = 0.0f;
+            for (int e = lane; e < row; e += 32) acc += s_qa[e] * lat_f(l[e]);
+            dot = warp_sum(acc) * scale;
+        }
+        if (lane == 0) s_p[s] = dot;
+    }
+    __syncthreads();
+    float mx = -INFINITY;
+    for (int s = tid; s < n_sel; s += blockDim.x) mx = fmaxf(mx, s_p[s]);
+    mx = block_max(mx, sred);
+    float den = 0.0f;
+    for (int s = tid; s < n_sel; s += blockDim.x) {
+        const float e = s_p[s] == -INFINITY ? 0.0f : expf(s_p[s] - mx);
+        s_p[s] = e;
+        den += e;
+    }
+    den = block_sum(den, sred);
+    const float invd = den > 0.0f ? 1.0f / den : 0.0f;
+    for (int c = tid; c < kv_lora; c += blockDim.x) {
+        float acc = 0.0f;
+        for (int s = 0; s < n_sel; ++s) {
+            const int cell = cells[s];
+            if (cell >= 0) acc += (s_p[s] * invd) * lat_f(lat[(size_t) row * cell + c]);
+        }
+        s_ctx[c] = acc;
+    }
+    __syncthreads();
+    const uint16_t* wv = wv_b + (size_t) kv_lora * v_head * h;
+    for (int vv = warp; vv < v_head; vv += nw) {
+        const uint16_t* wr = wv + (size_t) kv_lora * vv;
+        float acc = 0.0f;
+        for (int c = lane; c < kv_lora; c += 32) acc += bf(wr[c]) * s_ctx[c];
+        acc = warp_sum(acc);
+        if (lane == 0) s_out[vv] = acc;
+    }
+    __syncthreads();
+    for (int vv = tid; vv < v_head; vv += blockDim.x)   // warp-aligned runs of 32
+        q8_1_store_warp(s_out[vv], out + ((size_t) v_head * h + vv) / 32, lane);
+}
+
+__global__ void add_into_kernel(float* __restrict__ h, const float* __restrict__ add, int n) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) h[i] += add[i];
+}
+
+void add_into(float* h, const float* add, int n, cudaStream_t s) {
+    add_into_kernel<<<(n + 255) / 256, 256, 0, s>>>(h, add, n);
+    launch_check("add_into");
+}
+
+void rope_norm(float* x, int n_vec, int stride, int off, int n_rot, long long pos, float base, cudaStream_t s) {
+    const int n = n_vec * (n_rot / 2);
+    if (n <= 0) return;
+    rope_norm_kernel<<<(n + 255) / 256, 256, 0, s>>>(x, n_vec, stride, off, n_rot, pos, base);
+    launch_check("rope_norm");
+}
+
+void dsa53_prep(const Dsa53PrepArgs& a, cudaStream_t s) {
+    dsa53_prep_kernel<<<3, 512, 0, s>>>(a);
+    launch_check("dsa53_prep");
+}
+
+// q's nope parts packed head after head (q rows are [nope | rope], qs floats apart): headwise_gemv's input layout
+__global__ void q53_pack_kernel(const float* __restrict__ q, int qs, int qk_nope, int n_head, float* __restrict__ qn) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n_head * qk_nope) return;
+    const int h = i / qk_nope, e = i - h * qk_nope;
+    qn[i] = q[(size_t) qs * h + e];
+}
+
+// mla_split_kernel with the RoPE tail: a chunk of MLA_CHUNK cache rows of kv_lora + qk_rope FP16 in shared memory, scored
+// against every head of the group (q_abs over the latent, q's rope part over the tail), the chunk's max / sum / exp-
+// weighted context over the latent per head into `part` (mla_combine_kernel merges them)
+__global__ void __launch_bounds__(256) mla53_split_kernel(const float* __restrict__ q_abs, const float* __restrict__ q,
+                                                          int qs, int qk_nope, int qk_rope, const uint16_t* __restrict__ lat,
+                                                          const int* __restrict__ cells, int n_sel, int n_head,
+                                                          int kv_lora, float scale, float* __restrict__ part) {
+    extern __shared__ float smem[];
+    const int row = kv_lora + qk_rope;
+    uint16_t* sL = (uint16_t*) smem;                   // MLA_CHUNK x row, FP16
+    float* sS = smem + MLA_CHUNK * row / 2;            // MLA_HPB x MLA_CHUNK scores -> weights
+    __shared__ int s_cell[MLA_CHUNK];
+    const int b = blockIdx.x, tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, nw = blockDim.x >> 5;
+    const int h0 = blockIdx.y * MLA_HPB, nh = min(MLA_HPB, n_head - h0);
+    const int s0 = b * MLA_CHUNK;
+    const int ns = min(MLA_CHUNK, n_sel - s0);
+    if (tid < MLA_CHUNK) s_cell[tid] = tid < ns ? cells[s0 + tid] : -1;
+    __syncthreads();
+    for (int i = tid; i < MLA_CHUNK * row; i += blockDim.x) {
+        const int sr = i / row, c = i - sr * row;
+        const int cell = s_cell[sr];
+        sL[i] = cell < 0 ? (uint16_t) 0 : lat[(size_t) row * cell + c];
+    }
+    __syncthreads();
+    for (int hh = warp; hh < nh; hh += nw) {
+        float qa[16], qr[2];
+        const float* qh = q_abs + (size_t) kv_lora * (h0 + hh);
+        const float* rh = q + (size_t) qs * (h0 + hh) + qk_nope;
+#pragma unroll
+        for (int j = 0; j < 16; ++j) qa[j] = (lane + 32 * j) < kv_lora ? qh[lane + 32 * j] : 0.0f;
+#pragma unroll
+        for (int j = 0; j < 2; ++j) qr[j] = (lane + 32 * j) < qk_rope ? rh[lane + 32 * j] : 0.0f;
+        for (int sr = 0; sr < MLA_CHUNK; ++sr) {
+            const uint16_t* L = sL + sr * row;
+            float acc = 0.0f;
+#pragma unroll
+            for (int j = 0; j < 16; ++j)
+                if (lane + 32 * j < kv_lora) acc += qa[j] * lat_f(L[lane + 32 * j]);
+#pragma unroll
+            for (int j = 0; j < 2; ++j)
+                if (lane + 32 * j < qk_rope) acc += qr[j] * lat_f(L[kv_lora + lane + 32 * j]);
+            acc = warp_sum(acc);
+            if (lane == 0) sS[hh * MLA_CHUNK + sr] = s_cell[sr] >= 0 ? acc * scale : -INFINITY;
+        }
+    }
+    __syncthreads();
+    float* pm = part + ((size_t) b * n_head + h0) * (kv_lora + 2);
+    for (int hh = warp; hh < nh; hh += nw) {
+        const float v = lane < MLA_CHUNK ? sS[hh * MLA_CHUNK + lane] : -INFINITY;
+        const float m = warp_max(v);
+        const float e = (v == -INFINITY) ? 0.0f : expf(v - m);
+        const float l = warp_sum(e);
+        if (lane < MLA_CHUNK) sS[hh * MLA_CHUNK + lane] = e;
+        if (lane == 0) {
+            pm[(size_t) hh * (kv_lora + 2) + kv_lora] = m;
+            pm[(size_t) hh * (kv_lora + 2) + kv_lora + 1] = l;
+        }
+    }
+    __syncthreads();
+    for (int i = tid; i < nh * kv_lora; i += blockDim.x) {
+        const int hh = i / kv_lora, c = i - hh * kv_lora;
+        float acc = 0.0f;
+#pragma unroll 8
+        for (int sr = 0; sr < MLA_CHUNK; ++sr) acc += sS[hh * MLA_CHUNK + sr] * lat_f(sL[sr * row + c]);
+        pm[(size_t) hh * (kv_lora + 2) + c] = acc;
+    }
+}
+
+// glm-dsa's MLA as Flash's split path: q_abs = wk_b . q_nope as head-wise GEMVs over the whole GPU, the attention in
+// chunks of cache rows read once for a whole group of heads (with the rope tail), the chunks merged, out = wv_b . ctx as
+// head-wise GEMVs writing the q8_1.  STRATA_GLM_MLA1=1 (or a shape it does not cover) keeps the one-block-per-head kernel.
+void mla53(const float* q, const uint16_t* wk_b, const uint16_t* wv_b, const uint16_t* lat, const int* cells, int n_sel,
+           int n_head, int qk_nope, int qk_rope, int kv_lora, int v_head, void* out_q8_1, cudaStream_t s) {
+    int dev = 0;
+    cudaGetDevice(&dev);
+    const int qs = qk_nope + qk_rope, row = kv_lora + qk_rope;
+    // the scratch and the chunks' partials: a set per stream (a test split's parts on one GPU run their windows'
+    // tokens at once, each part on its own stream - a set per device let them write each other's)
+    struct Bufs {
+        float* scratch = nullptr;
+        float* part = nullptr;
+        int part_chunks = 0;
+    };
+    static std::mutex bufs_mu;
+    static std::unordered_map<cudaStream_t, Bufs> bufs;
+    Bufs* b = nullptr;
+    {
+        std::lock_guard<std::mutex> lk(bufs_mu);
+        b = &bufs[s];
+    }
+    static int attr_smem[16] = {};
+    const int n_chunks = (n_sel + MLA_CHUNK - 1) / MLA_CHUNK;
+    const size_t smem = (size_t) MLA_CHUNK * row * sizeof(uint16_t) + (size_t) MLA_HPB * MLA_CHUNK * sizeof(float);
+    bool split = getenv("STRATA_GLM_MLA1") == nullptr && dev < 16 && kv_lora % 32 == 0 && kv_lora <= 512 &&
+                 qk_rope <= 64 && v_head % 32 == 0 && qk_nope % 8 == 0 && kv_lora % 8 == 0 && n_sel > 0;
+    if (split && b->scratch == nullptr &&
+        cudaMalloc(&b->scratch, ((size_t) 2 * n_head * kv_lora + (size_t) n_head * qk_nope) * sizeof(float)) != cudaSuccess) {
+        cudaGetLastError();
+        b->scratch = nullptr;
+        split = false;
+    }
+    if (split && b->part_chunks < n_chunks) {
+        const int want = std::max(n_chunks, 2048 / MLA_CHUNK);
+        if (b->part != nullptr) cudaFree(b->part);
+        if (cudaMalloc(&b->part, (size_t) want * n_head * (kv_lora + 2) * sizeof(float)) != cudaSuccess) {
+            cudaGetLastError();
+            b->part = nullptr;
+            b->part_chunks = 0;
+            split = false;
+        } else {
+            b->part_chunks = want;
+        }
+    }
+    if (split && attr_smem[dev] < (int) smem) {
+        if (cudaFuncSetAttribute(mla53_split_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) smem) == cudaSuccess)
+            attr_smem[dev] = (int) smem;
+        else {
+            cudaGetLastError();
+            split = false;
+        }
+    }
+    if (!split) {
+        const size_t sm = (size_t) (qk_nope + 2 * kv_lora + qk_rope + v_head + n_sel) * sizeof(float);
+        mla53_kernel<<<n_head, 256, sm, s>>>(q, wk_b, wv_b, lat, cells, n_sel, qk_nope, qk_rope, kv_lora, v_head,
+                                             (block_q8_1*) out_q8_1);
+        launch_check("mla53");
+        return;
+    }
+    float* q_abs = b->scratch;
+    float* ctx = q_abs + (size_t) n_head * kv_lora;
+    float* qn = ctx + (size_t) n_head * kv_lora;
+    q53_pack_kernel<<<(n_head * qk_nope + 255) / 256, 256, 0, s>>>(q, qs, qk_nope, n_head, qn);
+    headwise_gemv_kernel<<<n_head * kv_lora / 32, 256, 0, s>>>(wk_b, qn, kv_lora, qk_nope, q_abs, nullptr);
+    mla53_split_kernel<<<dim3(n_chunks, (n_head + MLA_HPB - 1) / MLA_HPB), 256, smem, s>>>(
+        q_abs, q, qs, qk_nope, qk_rope, lat, cells, n_sel, n_head, kv_lora, rsqrtf((float) qs), b->part);
+    mla_combine_kernel<<<n_head, 256, 0, s>>>(b->part, n_chunks, n_head, kv_lora, ctx);
+    headwise_gemv_kernel<<<n_head * v_head / 32, 256, 0, s>>>(wv_b, ctx, v_head, kv_lora, nullptr, (block_q8_1*) out_q8_1);
+    launch_check("mla53");
 }
 
 }  // namespace strata::kernels::glmf

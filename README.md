@@ -1,207 +1,123 @@
-<h1 align="center">Project Maya</h1>
+# GLM-5.3 Uncensored on Maya
 
-<p align="center"><b>A 321-billion-parameter AI model on your own GPU</b><br>
-GLM-5.3-Flash, private and fast · one NVIDIA GPU or up to 16 · AMD and Windows (experimental) · chat, pictures,
-OpenAI- and Anthropic-compatible API · several requests at once</p>
+**The full 753B-parameter GLM-5.3, uncensored, running at 43–57 tokens/s on seven consumer-and-datacenter GPUs, with 512K context.**
 
-<p align="center"><a href="https://buymeacoffee.com/peasantsmith">☕ Support Project Maya - buy me a coffee</a></p>
+This repository is a fork of [Project Maya](https://github.com/mw00/project-maya) (MIT), the engine that runs GLM-5.3-*Flash* on your own GPUs. Maya only supported the Flash model. Here the engine is ported to the **full GLM-5.3** (`glm-dsa`: MLA attention with RoPE, the token-level DSA indexer, 78 layers + NextN), a calibrated 2–3 bit quant is built for it, and refusals are removed in two steps: donor weights, then a runtime refusal vector.
 
-Models this size usually need a datacenter. Maya runs **[GLM-5.3-Flash](https://huggingface.co/zai-org/GLM-5.3-Flash)**
-(zai-org, MIT license) on the hardware you already have: 321 B parameters, about 18 B active per token, and a context
-of up to 1 M tokens. Its engine is built for this one model. It keeps the experts your conversation uses most on the
-GPU, the next ones in RAM and the rest on your NVMe SSD, and moves them as you chat. It measures your GPUs, CPU, RAM
-and SSD and tunes itself to them. Nothing leaves your machine.
+[Русская версия](README.ru.md) · [How it was made](docs/HOW-IT-WAS-MADE.md) · [Engine port](docs/GLM53-ENGINE-PORT.md) · [Model on Hugging Face](#download-the-model) · [Original Project Maya README](README.project-maya.md)
 
-- **Fast:** up to 118 tokens/s on four RTX 4090s, 81 on one RTX PRO 6000, 30+ on a single RTX 5090. Real numbers from
-  real users below.
-- **Close to the original:** Maya's own quants keep 97.7-99.2% of the FP8 model's zero-shot accuracy.
-- **Plugs into your tools:** OpenAI- and Anthropic-compatible API with tool calls, ready for coding agents.
-- **Several requests at once:** up to 8 answered together - for agents that run several sessions, or several people
-  on one PC.
-- **Everything in the box:** a chat and a live monitor in the browser, pictures, thinking levels, a one-command setup.
+---
 
-## The models
+## Results
 
-Project Maya's own quants of GLM-5.3-Flash, made from Z.ai's FP8 release with statistics from the FP8 model. Each keeps
-the model's MTP block, which drafts tokens ahead.
+| | Stock GLM-5.3 (our quant) | **GLM-5.3 Uncensored (this repo)** |
+| --- | ---: | ---: |
+| Refusals on 40 JailbreakBench requests | 39 / 40 | **2 / 40** |
+| Decode speed, English | 55–57 tok/s | **54 tok/s** |
+| Decode speed, Russian | 45 tok/s | **43–45 tok/s** |
+| Context | 256K | **512K** (1M works, ~30 tok/s) |
+| Size | 267 GB | 267 GB GGUF + 2.8 GB pack |
+| Quality vs the FP8 original (KL, 8 texts) | 0.204 (top-1 agreement 88.4%) | same weights except 155 donor tensors |
 
-| Model | Size | Made for | Against the FP8 model |
-| --- | ---: | --- | --- |
-| **Maya-S** (default) | 96.5 GB | PCs with a smaller memory pool (RAM and VRAM together) | 97.9% of its zero-shot accuracy; the same next token 83% of the time |
-| **Maya-S24** | 94.7 GB | cards of 24 GB or less: 4-bit attention leaves ~1.5 GB more of the card for experts, decode +14% | 97.7%; 83% |
-| **Maya-M** | 116 GB | a bigger memory pool; more bits where they count, calibrated toward tool calls and front-end code | 97.9%; 86% |
-| **Maya-M-Derisked** | 116 GB | Maya-M with a weight edit by [Blackfrost_AI](https://x.com/Blackfrost_AI) that reduces blanket refusals ([its repo](https://huggingface.co/peasantsmith/GLM-5.3-Flash-Maya-M-Derisked-IQ2_S-GGUF)); experimental | not measured yet |
-| **Maya-L** | 156.3 GB | the biggest memory pools | **99.2%**; 90% |
+Hardware: 5× RTX 4090 48 GB + 2× A100 40 GB (320 GB VRAM total), 503 GB RAM. All experts live in VRAM; nothing is read from disk while generating.
 
-The setup asks which one to download and recommends one for your PC. How they're made and measured: [MAYA-S](bench/results/MAYA-S.md),
-[MAYA-S24](bench/results/MAYA-S24.md), [MAYA-M](bench/results/MAYA-M.md), [MAYA-L](bench/results/MAYA-L.md). On
-[Hugging Face](https://huggingface.co/peasantsmith/GLM-5.3-Flash-Maya-GGUF).
+Speed history of the port on that machine: 14.5 tok/s (first working build, larger quant) → 20 (MTP) → 38.6 (smaller calibrated quant) → **45–57 (pipelined MTP window)**. Without MTP: 24 tok/s.
 
-<details>
-<summary>Community quants that also run on Maya</summary>
+## What is in here
 
-| Model | Size | How | Notes |
-| --- | ---: | --- | --- |
-| [EXL3 3.05 bpw](https://huggingface.co/turboderp/GLM-5.3-Flash-exl3/tree/3.05bpw) by turboderp | 125.3 GB | in the setup: `--model EXL3-3.05bpw` | NVIDIA only, experimental |
-| [EXL3 4.05 bpw](https://huggingface.co/turboderp/GLM-5.3-Flash-exl3/tree/4.05bpw) by turboderp | 165.2 GB | in the setup: `--model EXL3-4.05bpw` | NVIDIA only, experimental |
-| [AJ-IQ2_XXS](https://huggingface.co/aj9o9/GLM-5.3-Flash-GGUF/tree/main/AJ-IQ2_XXS) by aj9o9 | 87.4 GB | its files, then `--gguf-dir` | no MTP block |
-| [AJ-IQ3_XXS](https://huggingface.co/aj9o9/GLM-5.3-Flash-GGUF/tree/main/AJ-IQ3_XXS) by aj9o9 | 112.4 GB | its files, then `--gguf-dir` | no MTP block |
+- **Engine port to `glm-dsa`** (`src/core/glm_*.cu`, `src/kernels/cuda/glm_*.cu`): the full GLM-5.3 inside Maya's existing `Glm5Model`, behind architecture flags, so Flash keeps working and GLM-5.3 inherits everything Maya already had — the VRAM/RAM/disk expert tiers, splitting layers across GPUs, multi-token prediction, batched prompt processing, KV streaming, the OpenAI/Anthropic-compatible server and the browser chat.
+- **Pipelined MTP window** (`STRATA_GLM_MTP_PIPE=1`, `decode_mtp_pipe` in `src/core/glm_mtp.cu`): the NextN head drafts a chain of up to 7 tokens on the last GPU, and the chain is verified as a window flowing through all seven GPUs. Output is token-for-token identical to plain decoding; speed goes from ~32 to 45–57 tok/s.
+- **Runtime refusal vector** (`src/core/glm_ablate.cuh`, `STRATA_GLM_ABLATE*`): three directions per layer projected out of the residual stream after every layer. No requantization — switch it off, or change its strength, in the config.
+- **Quantization toolchain** (`tools/glm53/`): FP8 calibration statistics, imatrix + GPTQ for the experts, the recipes, the donor merge (`make_gm24u.py`), the refusal-direction capture (`tools/glm53/ablate/`).
+- **Tests**: a 6-layer synthetic GLM-5.3 checked against `transformers` (`tests/glm_dsa_model_test.cpp`), slow-vs-fast path parity, the geometry loader test.
 
-</details>
+## Quick start
 
-## How fast is it?
+### 1. Build the engine
 
-Real machines, real numbers, most of them measured with `./maya.sh --bench`. A token is about ¾ of a word.
+The same installer as upstream Maya (Linux x86-64, NVIDIA driver, CUDA 12.x or 13, Python 3.10+; see
+[Project Maya's requirements](README.project-maya.md)):
 
-| Machine | Model | Decode (writing the answer) | Prefill (reading your prompt) | By |
-| --- | --- | ---: | ---: | --- |
-| **4x RTX 4090 24 GB** (PCIe 4.0 x16), Xeon w7-3445, 62 GB RAM | Maya-S24 | **118 tokens/s** | 4129 tokens/s | @0xPreDa (v1.0.31, #89) |
-| **RTX PRO 6000 Blackwell 96 GB**, Ryzen 7 9800X3D, 61 GB RAM | Maya-M, 256K context | **81.0 tokens/s** | 3102 tokens/s | @yundddd (v1.1.7, #172) |
-| **2x NVIDIA CMP 170HX 64 GB** (PCIe Gen2 x4 each), 2x Xeon E5-2690 v4, 91 GB RAM | Maya-M, every expert in VRAM | 61.3 tokens/s | 514 tokens/s | @ZackO2o (v1.0.6, #22) |
-| **2x RTX 5880 Ada 45 GB** (PCIe 4.0 x16), Xeon Gold 5420+, 393 GB RAM | Maya-L, 256K context | 54.5 tokens/s | 1401 tokens/s | @vjsyong (v1.1.4, #149) |
-| **2x RTX 3090 24 GB** (PCIe 4.0 x16, power-capped at 225 W), Threadripper 3970X, 128 GB RAM | Maya-S24 | 53.0 tokens/s | 885 tokens/s | @briepala (v1.1.2, #135) |
-| **4x Tesla V100 32 GB** (PCIe 3.0 x16), 24 CPU cores, a 100 GiB RAM limit | Maya-L, 32K context | 48.3 tokens/s (after `--calibrate`) | 499 tokens/s | @areslp (v1.1.3, [#130](https://github.com/mw00/project-maya/issues/130)) |
-| **2x RTX 3090 24 GB** (PCIe 4.0 x16, power-capped at 250 W), EPYC 7452, 256 GB RAM | Maya-M / Maya-L, 128K context | 44.0 / 30.2 tokens/s | 860 / 801 tokens/s | @orochifj (v1.1.4, #165) |
-| **2x RTX 4090 24 GB** (PCIe 3.0 + 4.0 x16), 2x Xeon Silver 4309Y, 188 GB RAM | Maya-S24 | 40.5 tokens/s | 1271 tokens/s | @fuad00 (v1.1.0, #122) |
-| **2x Tesla V100 32 GB** (PCIe 3), Xeon E5-2690 v4, 30 GB RAM | Maya-S | up to 40 tokens/s | up to 670 tokens/s | maintainer |
-| **RTX 3090 24 GB + RTX 3060 12 GB** (PCIe 4.0 x16), EPYC 7702P (8-channel DDR4), 141 GB RAM (a VM) | Maya-M, 128K context | 33.7 tokens/s | 682 tokens/s | @erikash (v1.1.4, #157) |
-| **RTX 5090 32 GB**, Ryzen 9 7950X, 96 GB DDR5 | Maya-M | 30+ tokens/s | ~2000 tokens/s | @siganos (#43) |
-| **AMD Radeon 8065S** (Ryzen AI Max+ PRO 495, 192 GB LPDDR5X, 160 GB of it for the GPU), Windows 11 | Maya-S, 32K context | up to 29.6 tokens/s (23.2 after an 8K-token prompt) | 278 tokens/s | maintainer (v1.1.10) |
-| **1x RTX 3090 24 GB** (PCIe 4.0 x16), EPYC 7702P (8-channel DDR4), 141 GB RAM (a VM) | Maya-M, 128K context | 27.0 tokens/s | 1069 tokens/s | @erikash (v1.1.4, #157) |
-| **1x Tesla V100 32 GB** (PCIe 3), 2x Xeon Gold 6138, 183 GB RAM | Maya-S24 | 26.8 tokens/s | 541 tokens/s | maintainer (v1.1.7, #171) |
-| **4x RTX 3080 20 GB**, 64 GB DDR4 | Maya-M, 512K context | 26.3 tokens/s (a day of use) | - | @CoolJohn-lab (#104) |
-| **1x RTX 3090 24 GB** (power-capped at 225 W), Threadripper 3970X, 128 GB RAM | Maya-S24 | 26.0 tokens/s | 913 tokens/s | @briepala (v1.1.2, #135) |
-| **RTX PRO 4000 Blackwell 24 GB**, Core i9-13900K, 128 GB DDR5 | Maya-S24 | 24.7 tokens/s | 1146 tokens/s | @morrisfamily (v1.1.7, #174) |
-| **RTX 5090 32 GB** (PCIe 5.0 x16), Core i9-13900K, 64 GB RAM, Windows 11 | Maya-S, 128K context | 23.0 tokens/s | 2173 tokens/s | @gianbing (v1.1.3, #139) |
-| **4x Tesla T4 16 GB**, Xeon E5-2660 v2, 220 GB RAM | Maya-S | 22.6 tokens/s | 416 tokens/s | @ksanislo (v1.0.16, #36) |
-| **1x Tesla V100 32 GB** (PCIe 3), Core i5-12600T, 64 GB RAM | Maya-S | up to 19 tokens/s | up to 620 tokens/s | maintainer |
-| **AMD Radeon 8060S** (Ryzen AI Max+ 395, 128 GB, 96 GB of it for the GPU), Windows 11 | Maya-S | 18.3 tokens/s | 320 tokens/s | @LIN-LAB-AI (v1.0.30, #102) |
-| **RTX 3090 Ti 24 GB** (PCIe 3.0 x16, a VM), EPYC 7302P, 240 GB RAM | Maya-L, 32K context | 18.2 tokens/s (tuned, #177) | 791 tokens/s | @Jw88888 (v1.1.7, #177) |
-| **RTX 4090 24 GB**, Ryzen 9 9950X3D, 192 GB DDR5, Windows 11 | Maya-L, 128K context | 16.4 tokens/s | 1371 tokens/s | @npc97 (v1.0.24, #63) |
-| **RTX 5090 Laptop 24 GB**, Core Ultra 9 275HX, 64 GB RAM, Windows 11 (a laptop) | Maya-S24 | 14.5 tokens/s | 994 tokens/s | @klvnblst (v1.0.30, #67) |
-
-Prefill is an 8K-token prompt. The speed holds as a conversation grows, and the first answers after a start are the
-slowest while the caches fill with what you use. Share yours: `--bench`, then `--report`, in a
-[GitHub issue](https://github.com/mw00/project-maya/issues).
-
-**Several requests at once** (`--parallel`) add up: on one GPU a token of each goes through the model together, so
-the dense weights are read once for all of them. In tokens per second for all of them together, against the same
-questions one after another: x1.41 for two and x1.35 for four on a V100 that streams most of Maya-S's experts from
-RAM, x1.67 for two and x2.02 for four on a Gorgon Halo (Radeon 8065S, 160 GB for the GPU) that holds every expert in
-GPU memory. The more of the model
-VRAM holds, the more it gains ([how](docs/SETTINGS.md#several-requests-at-once)).
-
-## What you need
-
-| | |
-| --- | --- |
-| **GPU** | NVIDIA, compute capability 7.0 or newer (V100, RTX 20 and newer): one, or up to 16 that share the model. More VRAM is faster. **AMD (experimental):** RX 7900 XT / XTX, Radeon AI PRO R9700 / RX 9070, Strix Halo and Gorgon Halo (Radeon 8060S / 8065S), text only - [docs/AMD_MAYA.md](docs/AMD_MAYA.md) |
-| **RAM** | 32 GB runs it. More RAM keeps more experts close and is faster |
-| **Disk** | **A fast NVMe SSD** with room for the model (~100 GB for Maya-S, ~160 GB for Maya-L) and its picture encoder (1.1 GB). Not a hard disk |
-| **System** | Linux (x86-64; a CPU with AVX2 is best), the NVIDIA driver, CUDA 12.x (CUDA 13 works for RTX 20 and newer, not for the V100), g++, Python 3.10+. Windows 10/11 (experimental): [docs/WINDOWS.md](docs/WINDOWS.md). Not WSL2. AMD: ROCm 7 |
-
-The setup checks all of this, prints the exact command for anything missing, and installs nothing system-wide.
-
-## Install
-
-```sh
-git clone https://github.com/mw00/project-maya.git && cd project-maya
+```bash
+git clone https://github.com/denisnotes357-prog/GLM-5.3-Uncensored-Maya
+cd GLM-5.3-Uncensored-Maya
 ./setup.sh
 ```
 
-Answer a few questions (Enter takes the recommended choice). The setup shows every download before it starts it,
-builds everything once (20-40 minutes plus the download) and **starts the model**. Then open
-`http://127.0.0.1:8080`. Ctrl+C stops it, and `./setup.sh` starts it again right away.
+It creates the private Python environment `.venv`, fetches ggml at the pinned llama.cpp commit and builds `build/strata`.
+When it offers to download a model, answer **no** — it would fetch GLM-5.3-Flash, not this model. Rebuilding later:
+`cmake --build build -j --target strata`. The port was built and tested for `sm_80` (A100) and `sm_89` (RTX 4090).
 
-- **Windows:** `START-MAYA.bat` instead of `./setup.sh` - see [docs/WINDOWS.md](docs/WINDOWS.md).
-- **AMD:** [docs/AMD_MAYA.md](docs/AMD_MAYA.md).
-- **Updating:** the dashboard's **About > Update**, or `git pull` then `./setup.sh`. The model isn't downloaded again.
-- **Every option** (GPUs, context, a model folder you already have, remote access, ...): [docs/SETUP.md](docs/SETUP.md).
+### 2. Download the model
 
-> **The start takes a few minutes:** the engine pins most of the free RAM (all but about 6 GB) for its expert tier,
-> so other programs get little RAM while Maya runs.
+```bash
+pip install -U huggingface_hub
+hf download denisnotes357-prog/GLM-5.3-Uncensored-Maya --local-dir models/GLM-5.3-Uncensored-Maya
+```
 
-## Using it
+The download is ~270 GB: six GGUF shards and `pack/` (the engine's index of those shards plus the dense weights; it finds the shards next to itself).
 
-- **In the browser:** chat (kept in your browser, per-chat instructions, edit and regenerate, HTML previews), a live
-  **Monitor** of the model and your hardware (down to what fills each GPU's memory), and a context size you can change
-  in Settings.
-- **Your apps and coding agents:** an OpenAI-compatible API at `http://127.0.0.1:8080/v1`, and Anthropic's at
-  `http://127.0.0.1:8080/v1/messages` (Claude Code: `ANTHROPIC_BASE_URL=http://127.0.0.1:8080`). Tool calls are
-  streamed as the model writes them, and a long prompt's reading progress too when a request asks for it
-  (`"return_progress": true`). A web page served from another address can call it too once you allow its
-  address (`"cors_origins"`, [docs/SETUP.md](docs/SETUP.md#web-pages-on-another-address)).
-- **Thinking:** Off, Low, High (the default) or Max, in Settings or per request.
-- **Pictures:** attach one in the chat, or send image parts through either API.
-- **From another device:** `./maya.sh --setup --host 0.0.0.0 --api-key <secret>`. Always set a key.
-- **Tuning:** `./maya.sh --calibrate` tunes the engine to your hardware in 10-15 minutes. Every setting:
-  [docs/SETTINGS.md](docs/SETTINGS.md).
-- **Several requests at once:** `./maya.sh --parallel 4` (Windows: `START-MAYA.bat --parallel 4`; up to 8) keeps
-  it in the config, and the dashboard shows how many answers are being written. Each extra request keeps its own
-  context in VRAM, so a few fewer experts fit there ([how](docs/SETTINGS.md#several-requests-at-once)).
-- **Long contexts:** new setups keep each attention layer's cache in RAM with a window of it in VRAM
-  (`--kv-streaming on`; `./maya.sh --setup` adds it to an existing config), so the VRAM holds more experts - at 512K
-  on an RTX 3090, prompts 4-9x faster and decode +5%; 1M context fits one 3090
-  ([how](docs/SETTINGS.md)).
-- **Faster answers with a DFlash2 drafter:** `./maya.sh --setup --draft dflash2` (NVIDIA RTX 30 / A100 and newer)
-  downloads a small drafter that drafts up to 7 tokens a round and gives the same answers - Maya-L +44% on nine GPUs
-  and +12% on two (against the MTP block), +19% on one RTX 3090 ([how](docs/SETTINGS.md#drafting-with-dflash2)). How
-  much it gains depends on the PC: on one GPU that reads much of the model from RAM it is often slower. So a
-  [speed calibration](docs/SETTINGS.md#the-speed-calibration) measures it on your PC and keeps it only where it is
-  faster. The drafter's license is non-commercial (CC BY-NC-ND 4.0).
+### 3. Run
 
-## Something went wrong?
+```bash
+tools/glm53/run-glm53.sh                                     # uncensored: donor weights + refusal vector
+tools/glm53/run-glm53.sh configs/glm53-uncensored-novector.json   # donor weights only
+```
 
-Run **`./maya.sh --report`** (Windows: `START-MAYA.bat --report`) right after a slow answer or an error, and attach the
-`maya-report.txt` it writes to a [GitHub issue](https://github.com/mw00/project-maya/issues). It holds your hardware,
-your setup and the engine's speed lines; nothing is sent anywhere by itself. The engine's own log is
-`maya-<model>.log` in the Maya folder.
+- Chat in the browser: http://127.0.0.1:8095/
+- OpenAI API: `http://127.0.0.1:8095/v1/chat/completions`, model `glm-5.3`
+- Anthropic API: `http://127.0.0.1:8095/v1/messages` (Claude Code: `ANTHROPIC_BASE_URL=http://127.0.0.1:8095`)
+- Thinking: `reasoning_effort` = `none` / `low` / `high` (default) / `max`
+- Live speed monitor: http://127.0.0.1:8095/#monitor
 
-- **"nvcc ... cannot build for these GPUs":** Volta needs CUDA 12.x, Blackwell 12.8 or newer. The setup takes the
-  newest installed toolkit that fits.
-- **`cuda_profiler_api.h` or `nvtx3/nvToolsExt.h` is missing:** Maya's CUDA build needs the profiler API
-  and NVTX headers as well as `nvcc` and the runtime. Install those development components for your toolkit.
-  With a split CUDA 13 toolkit, NVIDIA's official header wheels can also stay in a project-local folder:
+Loading takes about 3 minutes (the experts are warmed into VRAM). The server log should contain
+`glm ablate: 1437696 values from tools/glm53/ablate/dir3.f32 ... per layer, scale 1.00`.
 
-  ```sh
-  python3 -m pip install --target .cuda-headers \
-    nvidia-cuda-profiler-api==13.3.27 nvidia-nvtx==13.3.29
-  CPATH="$PWD/.cuda-headers/nvidia/cu13/include${CPATH:+:$CPATH}" ./maya.sh --setup
-  ```
+### Fitting your GPUs
 
-  Select wheel versions that match your toolkit. This include layout was checked with CUDA 13.3,
-  `nvidia-cuda-profiler-api==13.3.27` and `nvidia-nvtx==13.3.29`; other CUDA major versions can use a
-  different layout. Use the same `CPATH` when rebuilding after an update. No shared toolkit files need changing.
-- **"unsupported GNU version":** `./maya.sh --setup --host-compiler g++-12` (install `g++-12` first).
-- **Slow, with the SSD busy all the time:** not enough free RAM for the experts. Close programs or add RAM.
-- **Windows: answers suddenly several times slower:** the card is too full and Windows moves GPU memory to RAM. Leave
-  more of it free: `START-MAYA.bat --setup --vram-reserve-mib 2048`
-  ([the expert pool's size](docs/SETTINGS.md#the-expert-pools-size)).
-- **The download stopped:** run `./maya.sh` again; it continues where it stopped.
-- **Port 8080 is in use:** Maya is already running, or `--port 8081` starts another one.
+The shipped config is for 7 GPUs with ~320 GB of VRAM. The keys that matter:
 
-## Support
+| Key | Meaning |
+| --- | --- |
+| `gpu: [5, 0, 2, 3, 4, 7, 6]` | the order of the cards along the layer pipeline (the slower A100s at the ends) |
+| `STRATA_GLM_SPLIT=10,22,34,46,58,70` | first layer of each next GPU; every part must start on a layer with its own DSA indexer |
+| `--max-context 512000` | 512K fits without moving experts out of VRAM on this machine; 1M works with ~30% of experts in RAM |
+| `STRATA_GLM_RAM_RESIDENT=1` | whatever does not fit in VRAM is served from RAM, never from disk |
+| `STRATA_GLM_MTP_PIPE=1`, `STRATA_GLM_MTP_DRAFT=7` | the pipelined MTP window |
+| `STRATA_GLM_ABLATE_SCALE` | strength of the refusal vector (default 1.0; 1.5 was worse) |
+| `STRATA_GLM_DSA_DEV=1` | the GLM-5.3 path is marked experimental; the engine refuses `glm-dsa` without it |
 
-Project Maya is free and open source. If it's useful to you, you can support it at
-**[buymeacoffee.com/peasantsmith](https://buymeacoffee.com/peasantsmith)**. Thank you!
-Speed reports, bug reports and pull requests are welcome: [CONTRIBUTING.md](CONTRIBUTING.md) says what helps most.
+With less VRAM, Maya's tiers still work: experts that do not fit are served from RAM (slower, see the 1M-context numbers).
 
-## Credits and license
+## How the uncensoring works
 
-- **Built on [Strata](https://github.com/Niko1221/Strata)** (MIT License, Copyright (c) 2026 Niko1221 and the Strata
-  contributors): Maya's engine started from Strata's and was rewritten for GLM-5.3-Flash (the expert tiers across VRAM,
-  RAM and SSD, the layer split, MTP decoding), and its server and dashboard grew from Strata's. **And on
-  [ggml / llama.cpp](https://github.com/ggml-org/llama.cpp)** (MIT License, Copyright (c) 2023-2026 The ggml
-  authors): the quantization formats, the CPU dot products and the prompt path's MMQ kernels, built from a pinned
-  commit (`third_party/ggml/LICENSE`).
-- **EXL3 support** follows [exllamav3](https://github.com/turboderp-org/exllamav3)'s format, codebooks, CPU expert
-  kernel and tensor-core decoding of a tile (MIT License, Copyright (c) 2025 Turboderp; `third_party/exllamav3/LICENSE`). **The DFlash2 drafter's
-  forward** follows [beellama.cpp](https://github.com/Anbeeld/beellama.cpp)'s (MIT License, Copyright (c) 2023-2026
-  The ggml authors, Anbeeld; `third_party/beellama.cpp/LICENSE`).
-- The model: [GLM-5.3-Flash](https://huggingface.co/zai-org/GLM-5.3-Flash) by zai-org (MIT); Maya's quants and the
-  image encoder file are made from zai-org's released weights and keep its license. The optional DFlash2 drafter
-  ([GLM-5.3-Flash-DFlash2-GGUF](https://huggingface.co/Anbeeld/GLM-5.3-Flash-DFlash2-GGUF) by Anbeeld) is CC BY-NC-ND
-  4.0, non-commercial use only, and is downloaded only when you choose it.
-- The dashboard's font: Outfit (SIL Open Font License 1.1, `serve/web/fonts/OFL.txt`).
-- Maya is open source under the [MIT License](LICENSE); the notices of Strata, ggml, exllamav3 and beellama.cpp stay
-  with every copy.
+1. **Donor weights.** [`dealignai/GLM-5.3-UNCENSORED-FP8`](https://huggingface.co/dealignai/GLM-5.3-UNCENSORED-FP8) (MIT) differs from the original only in `self_attn.o_proj` and `mlp.shared_experts.down_proj` — 155 tensors, 8.9 GB. We downloaded just those tensors, quantized them to the same types our quant uses, and swapped them in (`tools/glm53/make_gm24u.py`). Refusals: 39 → 6 of 40.
+2. **Runtime refusal vector.** For the remaining refusals, three directions per layer (no thinking / open thinking / end of the model's own thinking) are measured on 256 harmful vs 100 harmless prompts and projected out of the residual stream after every layer while generating. Refusals: 6 → 2 of 40. The method and the original engine hook come from [alesha-pro](https://github.com/alesha-pro/project-maya/blob/glm-ablate/docs/GLM-ABLATE.md), who did it for GLM-5.3-Flash; here it is measured anew for the full 78-layer model.
+
+The two remaining refusals are the heaviest topics (harm to children, eating disorders), where the model turns the answer into a safe one. Details, numbers and dead ends: [docs/HOW-IT-WAS-MADE.md](docs/HOW-IT-WAS-MADE.md).
+
+## Download the model
+
+**Hugging Face:** [denisnotes357-prog/GLM-5.3-Uncensored-Maya](https://huggingface.co/denisnotes357-prog/GLM-5.3-Uncensored-Maya)
+
+| File | Size |
+| --- | ---: |
+| `GLM-5.3-Maya-G-M24U-GPTQ-0000{1..6}-of-00006.gguf` | 267 GB |
+| `pack/` (engine index + dense weights + tokenizer + chat template) | 2.8 GB |
+| `dir3.f32` (refusal vector, 78 × 3 × 6144 float32; also in this repo) | 5.8 MB |
+
+Quant recipe (`tools/glm53/recipes/g-m24a.json`): experts IQ2_S gate/up and IQ3_XXS down (IQ3_S down in layers 3–6 and 74–77), GPTQ-rounded against FP8 calibration statistics; attention projections and the shared expert Q4_K, on the A100 layers Q8_0; NextN Q3_K/Q4_K; router and norms F32. The tensor layout follows llama.cpp's `glm-dsa`; the tested runtime is this engine.
+
+## Responsible use
+
+This model will answer requests that the original refuses. It is published for research, red-teaming, private use and creative work by adults. You are responsible for how you use it and for complying with the laws that apply to you. The output can be wrong or harmful; do not rely on it for medical, legal, safety-critical or other high-stakes decisions.
+
+## Credits and licenses
+
+- **Project Maya** by Niko1221 and the Strata contributors — the engine, server and quant tools this repo is built on. MIT, see [LICENSE](LICENSE). Fork base: upstream commit `d187195` (2026-10-15).
+- **GLM-5.3** by Z.AI — the model. [GLM-5.3 License](LICENSES/GLM-5.3-LICENSE.txt) (permissive; includes a security-review condition for very large Model-as-a-Service operators).
+- **dealignai** — the uncensored donor tensors, [GLM-5.3-UNCENSORED-FP8](https://huggingface.co/dealignai/GLM-5.3-UNCENSORED-FP8), MIT.
+- **alesha-pro** — the runtime ablation hook for Maya and the three-direction method, [project-maya `glm-ablate`](https://github.com/alesha-pro/project-maya/blob/glm-ablate/docs/GLM-ABLATE.md).
+- **llama.cpp** and **transformers** — the reference implementations the port was checked against.
+
+See [NOTICE.md](NOTICE.md) for the full list. If this project is useful to you, a ⭐ helps others find it.

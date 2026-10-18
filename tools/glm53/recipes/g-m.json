@@ -1,0 +1,12 @@
+{"name": "Maya-G-M",
+ "note": "GLM-5.3 after Maya-M, sized for 7 GPUs (5x RTX 4090 48 GB + 2x A100 40 GB): IQ2_S routed gate/up, IQ3_XXS routed down, IQ3_S down in the first and last four MoE layers (3-6, 74-77); NextN experts Q3_K/Q4_K; router and its bias F32; indexer projections Q8_0, its head-weight projection F32; everything else 2-D Q6_K. With a 256K context its experts fit the 7 cards' pools, so no expert is read from RAM.",
+ "rules": [
+  {"match": "^blk\\.78\\.ffn_(gate|up)_exps", "type": "Q3_K"},
+  {"match": "^blk\\.78\\.ffn_down_exps", "type": "Q4_K"},
+  {"match": "ffn_(gate|up)_exps", "type": "IQ2_S"},
+  {"match": "^blk\\.([3-6]|7[4-7])\\.ffn_down_exps", "type": "IQ3_S"},
+  {"match": "ffn_down_exps", "type": "IQ3_XXS"},
+  {"match": "ffn_gate_inp|exp_probs_b|indexer\\.proj", "type": "F32"},
+  {"match": "indexer\\.", "type": "Q8_0"}
+ ],
+ "default": "Q6_K"}

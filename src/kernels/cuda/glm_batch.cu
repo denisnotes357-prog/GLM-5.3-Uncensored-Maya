@@ -92,10 +92,10 @@ __global__ void bf16_to_f16_kernel(const uint16_t* __restrict__ src, __half* __r
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) dst[i] = __float2half(__uint_as_float((uint32_t) src[i] << 16));
 }
-__global__ void embed_rows_kernel(const float* __restrict__ emb, float* __restrict__ R, int T, int E) {
+__global__ void embed_rows_kernel(const float* __restrict__ emb, float* __restrict__ R, int T, int E, int hc) {
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= (int64_t) T * 4 * E) return;
-    const int64_t t = i / (4 * (int64_t) E);
+    if (i >= (int64_t) T * hc * E) return;
+    const int64_t t = i / (hc * (int64_t) E);
     const int e = (int) (i % E);
     R[i] = emb[t * E + e];
 }
@@ -1230,6 +1230,161 @@ __global__ void __launch_bounds__(256) mla_attn_mma_kernel(const float* __restri
         }
     }
 }
+
+// glm-dsa (P4): mla_attn_mma_kernel with the RoPE tail - the scores over [q_abs (512) | q_rope (64)] against cache rows of
+// 576 (36 k-steps of 16), the context over the rows' first 512 (the latent).  Same tiles and online softmax.
+constexpr int M53_KS = 576, M53_LD = M53_KS + 8;
+constexpr size_t kM53Smem = ((size_t) (MT_H + MT_C) * M53_LD + (size_t) MT_H * (MT_C + 8)) * sizeof(__half) +
+                            (size_t) MT_H * MT_C * sizeof(float);
+__global__ void __launch_bounds__(256) mla53_attn_mma_kernel(const float* __restrict__ q_abs, const float* __restrict__ q,
+                                                             int q_stride, int qk_nope,
+                                                             const uint16_t* __restrict__ lat,
+                                                             const int* __restrict__ cells_all,
+                                                             const int* __restrict__ n_sel_arr, int n_sel_max, int n_head,
+                                                             float scale, float* __restrict__ ctx) {
+    extern __shared__ __align__(16) unsigned char mt_sm[];
+    __half* sQ = (__half*) mt_sm;                 // MT_H x M53_LD
+    __half* sL = sQ + MT_H * M53_LD;              // MT_C x M53_LD
+    __half* sP = sL + MT_C * M53_LD;              // MT_H x (MT_C + 8)
+    float* sS = (float*) (sP + MT_H * (MT_C + 8));              // MT_H x MT_C
+    __shared__ float s_m[MT_H], s_l[MT_H], s_sc[MT_H], s_qs[MT_H];
+    __shared__ int s_cell[MT_C];
+    const int t = blockIdx.x, h0 = blockIdx.y * MT_H, tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    const int ns = n_sel_arr[t];
+    const int* cl = cells_all + (size_t) t * n_sel_max;
+    for (int rr = 0; rr < MT_H / 8; ++rr) {
+        const int r = warp * (MT_H / 8) + rr;
+        const float* qa = q_abs + ((size_t) t * n_head + h0 + r) * MT_KV;
+        const float* qr = q + ((size_t) t * n_head + h0 + r) * q_stride + qk_nope;
+        float mx = 0.f;
+        for (int c = lane; c < MT_KV; c += 32) mx = fmaxf(mx, fabsf(qa[c]));
+        for (int c = lane; c < M53_KS - MT_KV; c += 32) mx = fmaxf(mx, fabsf(qr[c]));
+        mx = warp_max(mx);
+        int ex = 0;
+        if (mx > 0.f) {
+            frexpf(mx, &ex);
+            ex = max(-60, min(60, 14 - ex));
+        }
+        const float f = ldexpf(1.0f, ex);
+        for (int c = 2 * lane; c < MT_KV; c += 64)
+            *(__half2*) (sQ + r * M53_LD + c) = __floats2half2_rn(qa[c] * f, qa[c + 1] * f);
+        for (int c = 2 * lane; c < M53_KS - MT_KV; c += 64)
+            *(__half2*) (sQ + r * M53_LD + MT_KV + c) = __floats2half2_rn(qr[c] * f, qr[c + 1] * f);
+        if (lane == 0) s_qs[r] = ldexpf(1.0f, -ex);
+    }
+    if (tid < MT_H) {
+        s_m[tid] = -INFINITY;
+        s_l[tid] = 0.0f;
+    }
+    float acc[2][8][4];
+#pragma unroll
+    for (int a = 0; a < 2; ++a)
+#pragma unroll
+        for (int b = 0; b < 8; ++b)
+#pragma unroll
+            for (int c = 0; c < 4; ++c) acc[a][b][c] = 0.0f;
+    const int g = lane >> 2, q2 = (lane & 3) * 2;
+    for (int s0 = 0; s0 < ns; s0 += MT_C) {
+        __syncthreads();
+        if (tid < MT_C) s_cell[tid] = s0 + tid < ns ? cl[s0 + tid] : -1;
+        __syncthreads();
+        for (int i = tid; i < MT_C * M53_KS / 8; i += blockDim.x) {
+            const int r = i / (M53_KS / 8), c8 = i - r * (M53_KS / 8);
+            const int cell = s_cell[r];
+            uint4 v = make_uint4(0u, 0u, 0u, 0u);
+            if (cell >= 0) v = ((const uint4*) (lat + (size_t) M53_KS * cell))[c8];
+            *(uint4*) (sL + r * M53_LD + 8 * c8) = v;
+        }
+        __syncthreads();
+        {
+            const int mt = warp >> 2, nt = warp & 3;
+            float sacc[4] = {0.f, 0.f, 0.f, 0.f};
+#pragma unroll 4
+            for (int ks = 0; ks < M53_KS / 16; ++ks) {
+                uint32_t a0, a1, a2, a3, b0, b1;
+                mt_ldsm_x4(a0, a1, a2, a3, sQ + (mt * 16 + (lane & 15)) * M53_LD + ks * 16 + (lane >> 4) * 8);
+                mt_ldsm_x2(b0, b1, sL + (nt * 8 + (lane & 7)) * M53_LD + ks * 16 + ((lane >> 3) & 1) * 8);
+                mt_mma(sacc, a0, a1, a2, a3, b0, b1);
+            }
+            const int r0 = mt * 16 + g, c0 = nt * 8 + q2;
+            const float fa = scale * s_qs[r0], fb = scale * s_qs[r0 + 8];
+            sS[r0 * MT_C + c0] = sacc[0] * fa;
+            sS[r0 * MT_C + c0 + 1] = sacc[1] * fa;
+            sS[(r0 + 8) * MT_C + c0] = sacc[2] * fb;
+            sS[(r0 + 8) * MT_C + c0 + 1] = sacc[3] * fb;
+        }
+        __syncthreads();
+        {
+            const int r = tid >> 3, j0 = (tid & 7) * 4;
+            float v[4], mx = -INFINITY;
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                v[j] = s_cell[j0 + j] >= 0 ? sS[r * MT_C + j0 + j] : -INFINITY;
+                mx = fmaxf(mx, v[j]);
+            }
+#pragma unroll
+            for (int o = 4; o > 0; o >>= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, o));
+            const float m_old = s_m[r], m_new = fmaxf(m_old, mx);
+            float sum = 0.f;
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const float e = v[j] == -INFINITY ? 0.f : __expf(v[j] - m_new);
+                sum += e;
+                sP[r * (MT_C + 8) + j0 + j] = __float2half(e);
+            }
+#pragma unroll
+            for (int o = 4; o > 0; o >>= 1) sum += __shfl_xor_sync(0xffffffffu, sum, o);
+            __syncwarp();
+            if ((tid & 7) == 0) {
+                const float sc = m_old == -INFINITY ? 0.f : __expf(m_old - m_new);
+                s_sc[r] = sc;
+                s_l[r] = s_l[r] * sc + sum;
+                s_m[r] = m_new;
+            }
+        }
+        __syncthreads();
+#pragma unroll
+        for (int mt = 0; mt < 2; ++mt) {
+            const float sa = s_sc[mt * 16 + g], sb = s_sc[mt * 16 + g + 8];
+#pragma unroll
+            for (int nt = 0; nt < 8; ++nt) {
+                acc[mt][nt][0] *= sa;
+                acc[mt][nt][1] *= sa;
+                acc[mt][nt][2] *= sb;
+                acc[mt][nt][3] *= sb;
+            }
+        }
+#pragma unroll
+        for (int ks = 0; ks < MT_C / 16; ++ks) {
+            uint32_t pa[2][4];
+#pragma unroll
+            for (int mt = 0; mt < 2; ++mt)
+                mt_ldsm_x4(pa[mt][0], pa[mt][1], pa[mt][2], pa[mt][3],
+                           sP + (mt * 16 + (lane & 15)) * (MT_C + 8) + ks * 16 + (lane >> 4) * 8);
+#pragma unroll
+            for (int nt = 0; nt < 8; ++nt) {
+                uint32_t b0, b1;
+                mt_ldsm_x2_t(b0, b1, sL + (ks * 16 + (lane & 15)) * M53_LD + warp * 64 + nt * 8);
+#pragma unroll
+                for (int mt = 0; mt < 2; ++mt) mt_mma(acc[mt][nt], pa[mt][0], pa[mt][1], pa[mt][2], pa[mt][3], b0, b1);
+            }
+        }
+    }
+    __syncthreads();
+#pragma unroll
+    for (int mt = 0; mt < 2; ++mt) {
+        const int ra = mt * 16 + g, rb = ra + 8;
+        const float ia = s_l[ra] > 0.f ? 1.f / s_l[ra] : 0.f, ib = s_l[rb] > 0.f ? 1.f / s_l[rb] : 0.f;
+        float* oa = ctx + ((size_t) t * n_head + h0 + ra) * MT_KV;
+        float* ob = ctx + ((size_t) t * n_head + h0 + rb) * MT_KV;
+#pragma unroll
+        for (int nt = 0; nt < 8; ++nt) {
+            const int c = warp * 64 + nt * 8 + q2;
+            *(float2*) (oa + c) = make_float2(acc[mt][nt][0] * ia, acc[mt][nt][1] * ia);
+            *(float2*) (ob + c) = make_float2(acc[mt][nt][2] * ib, acc[mt][nt][3] * ib);
+        }
+    }
+}
 #endif
 
 #if defined(STRATA_USE_HIP)
@@ -1543,11 +1698,11 @@ __global__ void __launch_bounds__(256) mtp_in_rows_kernel(const float* __restric
                                                           __half* __restrict__ out) {
     __shared__ float sred[32];
     const int t = blockIdx.x, tid = threadIdx.x;
-    float a[16], b[16];
+    float a[32], b[32];
     float sa = 0.0f, sb = 0.0f;
     const int per = E / (int) blockDim.x;
 #pragma unroll
-    for (int i = 0; i < 16; ++i) {
+    for (int i = 0; i < 32; ++i) {
         if (i >= per) break;
         const int e = tid + i * (int) blockDim.x;
         a[i] = emb[(size_t) t * E + e];
@@ -1559,7 +1714,7 @@ __global__ void __launch_bounds__(256) mtp_in_rows_kernel(const float* __restric
     sb = block_sum(sb, sred);
     const float ia = rsqrtf(sa / (float) E + eps), ib = rsqrtf(sb / (float) E + eps);
 #pragma unroll
-    for (int i = 0; i < 16; ++i) {
+    for (int i = 0; i < 32; ++i) {
         if (i >= per) break;
         const int e = tid + i * (int) blockDim.x;
         out[(size_t) t * 2 * E + e] = __float2half(a[i] * ia * enorm[e]);
@@ -1571,11 +1726,11 @@ __global__ void __launch_bounds__(256) rms_rows_kernel(const float* __restrict__
                                                        int E, float* __restrict__ x, __half* __restrict__ x16) {
     __shared__ float sred[32];
     const int t = blockIdx.x, tid = threadIdx.x;
-    float v[16];
+    float v[32];
     float ss = 0.0f;
     const int per = E / (int) blockDim.x;
 #pragma unroll
-    for (int i = 0; i < 16; ++i) {
+    for (int i = 0; i < 32; ++i) {
         if (i >= per) break;
         const int e = tid + i * (int) blockDim.x;
         v[i] = in[(size_t) t * E + e];
@@ -1584,7 +1739,7 @@ __global__ void __launch_bounds__(256) rms_rows_kernel(const float* __restrict__
     ss = block_sum(ss, sred);
     const float inv = rsqrtf(ss / (float) E + eps);
 #pragma unroll
-    for (int i = 0; i < 16; ++i) {
+    for (int i = 0; i < 32; ++i) {
         if (i >= per) break;
         const int e = tid + i * (int) blockDim.x;
         const float xv = v[i] * inv * w[e];
@@ -1796,9 +1951,9 @@ void f32_to_f16(const float* src, void* dst, int64_t n, cudaStream_t s) {
     check("f32_to_f16");
 }
 
-void embed_rows(const float* emb, float* R, int T, int n_embd, cudaStream_t s) {
+void embed_rows(const float* emb, float* R, int T, int n_embd, cudaStream_t s, int hc) {
     if (T <= 0) return;
-    embed_rows_kernel<<<nblk((int64_t) T * 4 * n_embd), 256, 0, s>>>(emb, R, T, n_embd);
+    embed_rows_kernel<<<nblk((int64_t) T * hc * n_embd), 256, 0, s>>>(emb, R, T, n_embd, hc);
     check("embed_rows");
 }
 
@@ -2106,6 +2261,242 @@ void moe_combine(const float* out, const int* pos, const float* w, const float* 
     if (T <= 0) return;
     moe_combine_kernel<<<T, 256, 0, s>>>(out, pos, w, sh, k, n_embd, ffn);
     check("moe_combine");
+}
+
+
+// ================================================================================================================
+// glm-dsa (the full GLM-5.3, docs/GLM53-ENGINE-PORT.md P4): the prompt path's DSA pieces - the token path's
+// (glm_fast.cu dsa53_prep / rope_norm / mla53) for a chunk of rows.
+
+__device__ __forceinline__ void rope_pair53(float& x0, float& x1, long long pos, int j, int n_rot, float base) {
+    const double theta = (double) pos * pow((double) base, -2.0 * j / n_rot);
+    const float c = (float) cos(theta), sn = (float) sin(theta);
+    const float a = x0, b = x1;
+    x0 = a * c - b * sn;
+    x1 = a * sn + b * c;
+}
+
+// block (t, role): role 0 q_a norm -> qr / qr16; role 1 the cache row p0 + t [rms latent | rotated k_rope] (FP16);
+// role 2 (full layers) the rotated, layer-normed indexer key into ik_cache[p0 + t]
+__global__ void __launch_bounds__(512) dsa53_prep_kernel(const Dsa53PrepArgs a) {
+    __shared__ float sred[32];
+    __shared__ float sk[512];
+    const int t = blockIdx.x, role = blockIdx.y, tid = threadIdx.x;
+    const long long p = (long long) a.p0 + t;
+    if (role == 0) {
+        if (a.qr_raw == nullptr) return;
+        float vals[4];
+        float ss = 0.0f;
+        int n = 0;
+        for (int e = tid; e < a.q_lora && n < 4; e += 512, ++n) {
+            vals[n] = a.qr_raw[(size_t) t * a.q_lora + e];
+            ss += vals[n] * vals[n];
+        }
+        ss = block_sum(ss, sred);
+        const float inv = rsqrtf(ss / (float) a.q_lora + a.eps);
+        n = 0;
+        __half* q16 = (__half*) a.qr16;
+        for (int e = tid; e < a.q_lora && n < 4; e += 512, ++n) {
+            const float y = vals[n] * inv * a.q_a_norm[e];
+            a.qr[(size_t) t * a.q_lora + e] = y;
+            q16[(size_t) t * a.q_lora + e] = __float2half(y);
+        }
+        return;
+    }
+    if (role == 1) {
+        const int row = a.kv_lora + a.qk_rope;
+        const float* kr = a.kv_raw + (size_t) t * row;
+        uint16_t* dst = a.lat + (size_t) row * p;
+        const float v = tid < a.kv_lora ? kr[tid] : 0.0f;
+        const float ss = block_sum(v * v, sred);
+        const float inv = rsqrtf(ss / (float) a.kv_lora + a.eps);
+        if (tid < a.kv_lora) dst[tid] = __half_as_ushort(__float2half(v * inv * a.kv_norm[tid]));
+        if (tid < a.qk_rope / 2) {
+            float x0 = kr[a.kv_lora + 2 * tid], x1 = kr[a.kv_lora + 2 * tid + 1];
+            rope_pair53(x0, x1, p, tid, a.qk_rope, a.rope_base);
+            dst[a.kv_lora + 2 * tid] = __half_as_ushort(__float2half(x0));
+            dst[a.kv_lora + 2 * tid + 1] = __half_as_ushort(__float2half(x1));
+        }
+        return;
+    }
+    if (a.ik_raw == nullptr) return;
+    const int K = a.idx_key;
+    const float v = tid < K ? a.ik_raw[(size_t) t * K + tid] : 0.0f;
+    const float s1 = block_sum(v, sred);
+    const float s2 = block_sum(v * v, sred);
+    const float mu = s1 / (float) K;
+    const float inv = rsqrtf(s2 / (float) K - mu * mu + a.eps);
+    if (tid < K) sk[tid] = (v - mu) * inv * a.k_norm_w[tid] + a.k_norm_b[tid];
+    __syncthreads();
+    if (tid < a.qk_rope / 2) rope_pair53(sk[2 * tid], sk[2 * tid + 1], p, tid, a.qk_rope, a.rope_base);
+    __syncthreads();
+    if (tid < K) a.ik_cache[(size_t) K * p + tid] = sk[tid];
+}
+
+__global__ void rope_rows_kernel(float* __restrict__ x, int T, int n_vec, int stride, int row_stride, int off, int n_rot,
+                                 long long p0, float base) {
+    const int half = n_rot / 2;
+    const long long idx = (long long) blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= (long long) T * n_vec * half) return;
+    const int t = (int) (idx / ((long long) n_vec * half));
+    const int r = (int) (idx % ((long long) n_vec * half));
+    const int v = r / half, j = r % half;
+    float* q = x + (size_t) t * row_stride + (size_t) v * stride + off + 2 * j;
+    rope_pair53(q[0], q[1], p0 + t, j, n_rot, base);
+}
+
+__global__ void add_rows_kernel(float* __restrict__ R, const float* __restrict__ add, long long n) {
+    const long long i = (long long) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) R[i] += add[i];
+}
+
+// The absorbed attention with the RoPE tail, a chunk of rows: block (t, group of MLA53_HG heads), a warp per two heads;
+// the token's selected cache rows go through shared memory MLA53_CH at a time and every head of the group scores them
+// (q_abs over the latent, q's rotated rope part over the tail) and folds them into its context by an online softmax.
+// ctx[t][h] = softmax . latent (kv_lora floats); q_abs [t][h][kv_lora]; q [t][h][qk_nope + qk_rope].
+constexpr int MLA53_CH = 32, MLA53_HG = 16;
+__global__ void __launch_bounds__(256) mla53_attn_kernel(const float* __restrict__ q_abs, const float* __restrict__ q,
+                                                         const uint16_t* __restrict__ lat, const int* __restrict__ cells,
+                                                         const int* __restrict__ n_sel, int n_sel_max, int n_head,
+                                                         int qk_nope, int qk_rope, int kv_lora, float scale,
+                                                         float* __restrict__ ctx) {
+    extern __shared__ float smem53[];
+    const int row = kv_lora + qk_rope, qs = qk_nope + qk_rope;
+    uint16_t* sL = (uint16_t*) smem53;   // MLA53_CH rows
+    __shared__ int s_cell[MLA53_CH];
+    const int t = blockIdx.x, tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    const int ns = n_sel[t];
+    const int* ct = cells + (size_t) t * n_sel_max;
+    const int h0 = blockIdx.y * MLA53_HG + warp * 2;
+    float qa[2][16], qr[2][2], acc[2][16], m[2], l[2];
+#pragma unroll
+    for (int k = 0; k < 2; ++k) {
+        const int h = h0 + k;
+        m[k] = -INFINITY;
+        l[k] = 0.0f;
+#pragma unroll
+        for (int j = 0; j < 16; ++j) {
+            acc[k][j] = 0.0f;
+            qa[k][j] = h < n_head && lane + 32 * j < kv_lora ? q_abs[((size_t) t * n_head + h) * kv_lora + lane + 32 * j] : 0.0f;
+        }
+#pragma unroll
+        for (int j = 0; j < 2; ++j)
+            qr[k][j] = h < n_head && lane + 32 * j < qk_rope ? q[((size_t) t * n_head + h) * qs + qk_nope + lane + 32 * j] : 0.0f;
+    }
+    for (int c0 = 0; c0 < ns; c0 += MLA53_CH) {
+        const int nc = min(MLA53_CH, ns - c0);
+        __syncthreads();
+        if (tid < MLA53_CH) s_cell[tid] = tid < nc ? ct[c0 + tid] : -1;
+        __syncthreads();
+        for (int i = tid; i < MLA53_CH * row; i += blockDim.x) {
+            const int sr = i / row, c = i - sr * row;
+            const int cell = s_cell[sr];
+            sL[i] = cell < 0 ? (uint16_t) 0 : lat[(size_t) row * cell + c];
+        }
+        __syncthreads();
+        for (int sr = 0; sr < nc; ++sr) {
+            if (s_cell[sr] < 0) continue;
+            const uint16_t* L = sL + sr * row;
+            float lv[16];
+#pragma unroll
+            for (int j = 0; j < 16; ++j) lv[j] = lane + 32 * j < kv_lora ? __half2float(__ushort_as_half(L[lane + 32 * j])) : 0.0f;
+            float rv[2];
+#pragma unroll
+            for (int j = 0; j < 2; ++j) rv[j] = lane + 32 * j < qk_rope ? __half2float(__ushort_as_half(L[kv_lora + lane + 32 * j])) : 0.0f;
+#pragma unroll
+            for (int k = 0; k < 2; ++k) {
+                float d = 0.0f;
+#pragma unroll
+                for (int j = 0; j < 16; ++j) d += qa[k][j] * lv[j];
+#pragma unroll
+                for (int j = 0; j < 2; ++j) d += qr[k][j] * rv[j];
+                d = warp_sum(d) * scale;
+                const float mn = fmaxf(m[k], d);
+                const float al = expf(m[k] - mn), w = expf(d - mn);
+                l[k] = l[k] * al + w;
+#pragma unroll
+                for (int j = 0; j < 16; ++j) acc[k][j] = acc[k][j] * al + w * lv[j];
+                m[k] = mn;
+            }
+        }
+    }
+#pragma unroll
+    for (int k = 0; k < 2; ++k) {
+        const int h = h0 + k;
+        if (h >= n_head) continue;
+        const float inv = l[k] > 0.0f ? 1.0f / l[k] : 0.0f;
+#pragma unroll
+        for (int j = 0; j < 16; ++j)
+            if (lane + 32 * j < kv_lora) ctx[((size_t) t * n_head + h) * kv_lora + lane + 32 * j] = acc[k][j] * inv;
+    }
+}
+
+void dsa53_prep(const Dsa53PrepArgs& a, cudaStream_t s) {
+    if (a.T <= 0) return;
+    dsa53_prep_kernel<<<dim3(a.T, 3), 512, 0, s>>>(a);
+    check("dsa53_prep");
+}
+
+void rope_rows(float* x, int T, int n_vec, int stride, int row_stride, int off, int n_rot, long long p0, float base,
+               cudaStream_t s) {
+    const long long n = (long long) T * n_vec * (n_rot / 2);
+    if (n <= 0) return;
+    rope_rows_kernel<<<(unsigned) ((n + 255) / 256), 256, 0, s>>>(x, T, n_vec, stride, row_stride, off, n_rot, p0, base);
+    check("rope_rows");
+}
+
+void add_rows(float* R, const float* add, long long n, cudaStream_t s) {
+    if (n <= 0) return;
+    add_rows_kernel<<<(unsigned) ((n + 255) / 256), 256, 0, s>>>(R, add, n);
+    check("add_rows");
+}
+
+bool mla53_attn(const float* q_abs, const float* q, const uint16_t* lat, const int* cells, const int* n_sel,
+                int n_sel_max, int n_head, int qk_nope, int qk_rope, int kv_lora, float scale, int T, float* ctx,
+                cudaStream_t s) {
+    if (T <= 0) return true;
+#if !defined(STRATA_USE_HIP)
+    // the tensor cores (mma.sync, 32 heads a block) on Ampere and newer for GLM-5.3's shape; STRATA_GLM_PREFILL_ATTN=f32
+    // keeps the F32 kernel below
+    {
+        static int mma_ok[16] = {};
+        int dev = 0;
+        cudaGetDevice(&dev);
+        if (dev < 0 || dev >= 16) dev = 0;
+        static const char* mode = getenv("STRATA_GLM_PREFILL_ATTN");
+        if (mma_ok[dev] == 0) {
+            int major = 0;
+            cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev);
+            mma_ok[dev] = major >= 8 && !(mode != nullptr && std::strcmp(mode, "f32") == 0) &&
+                                  cudaFuncSetAttribute(mla53_attn_mma_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                                       (int) kM53Smem) == cudaSuccess
+                              ? 1 : -1;
+            cudaGetLastError();
+            std::fprintf(stderr, "glm_batch: CUDA%d glm-dsa prompt attention on the %s\n", dev,
+                         mma_ok[dev] > 0 ? "tensor cores (mma.sync, 32 heads a block)" : "F32 cores");
+        }
+        if (mma_ok[dev] > 0 && kv_lora == MT_KV && kv_lora + qk_rope == M53_KS && n_head % MT_H == 0) {
+            mla53_attn_mma_kernel<<<dim3(T, n_head / MT_H), 256, kM53Smem, s>>>(
+                q_abs, q, qk_nope + qk_rope, qk_nope, lat, cells, n_sel, n_sel_max, n_head, scale, ctx);
+            check("mla53_attn_mma");
+            return true;
+        }
+    }
+#endif
+    if (kv_lora > 512 || qk_rope > 64 || kv_lora % 32 != 0) return false;
+    const size_t smem = (size_t) MLA53_CH * (kv_lora + qk_rope) * sizeof(uint16_t);
+    static bool attr = false;
+    if (!attr) {
+        if (cudaFuncSetAttribute(mla53_attn_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) smem) != cudaSuccess) {
+            cudaGetLastError();
+            return false;
+        }
+        attr = true;
+    }
+    mla53_attn_kernel<<<dim3(T, (n_head + MLA53_HG - 1) / MLA53_HG), 256, smem, s>>>(
+        q_abs, q, lat, cells, n_sel, n_sel_max, n_head, qk_nope, qk_rope, kv_lora, scale, ctx);
+    check("mla53_attn");
+    return true;
 }
 
 }  // namespace strata::kernels::glmb

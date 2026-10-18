@@ -274,6 +274,8 @@ struct Glm5Model::FastState {
     float *qr_raw = nullptr, *qr = nullptr, *kv_raw = nullptr, *ik_raw = nullptr, *ig_raw = nullptr, *iw = nullptr;
     float *q = nullptr, *iq = nullptr, *score = nullptr;
     int* cells = nullptr;
+    void* sel_ws = nullptr;      // dsa_select's workspace (gf::kSelWsBytes): the several-block selection of a long context
+    int dsa53_n_sel = 0;   // glm-dsa: the cells of the last full-indexer layer (this token's), which shared layers reuse
     int* slot_cells = nullptr;   // KV streaming: the selection in VRAM slot rows (glm_kv_resolve), what the attention reads
     void *qr_q = nullptr, *attn_q = nullptr;
     float *rlog = nullptr, *plog = nullptr, *sh_g = nullptr, *sh_u = nullptr;
@@ -321,6 +323,7 @@ struct Glm5Model::FastState {
     int* mtp_tok = nullptr;
     int* mtp_tok_h = nullptr;    // pinned
     void* spec_q = nullptr;      // speculative sampling (STRATA_GLM_SPEC_SAMPLE): the draft's kept list, a device SpecList
+    void* spec_qs = nullptr;     // ... the pipelined MTP decode's: kPipeMax device SpecLists, draft step i's in spec_qs[i]
     cudaEvent_t ev_mtp = nullptr;
     // the one-GPU MTP decode (src/core/glm_mtp.cu) - the draft head over the draft vocabulary (Glm5Model::mtp_vocab_scan;
     // mtp_dv == 0: the whole head): the head's first mtp_dv rows in place, then mtp_dx rows gathered from the rest
@@ -332,6 +335,8 @@ struct Glm5Model::FastState {
     // step after the first read there; null: every draft step takes its embedding from the host.  The host's own rows
     // for a draft step go through mtp_emb_h, its copy out ordered by ev_mtp_emb
     void* mtp_emb = nullptr;
+    void* mtp_emb_host = nullptr;   // where mtp_emb is pinned host memory mapped into the device (the pipelined MTP
+                                    // decode's chain on a part without the room: a row a draft step over PCIe)
     int mtp_emb_type = -1;
     float* mtp_emb_h = nullptr;   // pinned
     cudaEvent_t ev_mtp_emb = nullptr;
@@ -554,6 +559,12 @@ struct Glm5Model::FastState {
         cudaEvent_t ev_pick[16] = {};       // ... and (the last part) each token's pick copied out
         int bank = 0;                       // ... the slots' bank this window (they alternate: kPipeMax a bank)
         bool pick_sampled = false;          // ... the picks drawn with pick_sp (row t at its counter + t), not argmax
+        // the pipelined MTP decode's speculative sampling (STRATA_GLM_SPEC_SAMPLE): rows 0 .. spec_rows - 1 of this window
+        // pick through sample_verify - the draft spec_drafts[t] drawn from the list spec_qs[t] (device, this part) with
+        // the row's own counter; the rest draw as before.  Set on the last part before win_pipe_begin
+        const void* spec_qs = nullptr;
+        const int* spec_drafts = nullptr;
+        int spec_rows = 0;
         // ... the tokens past the first wrong draft skip their heavy kernels: the head part's pinned word per bank
         // (`from_h`, the host writes the first doomed token there), this part's device flag (`skip_d`, each layer's
         // skip_gate copies the verdict for its token in) and the word this window reads (`from`)

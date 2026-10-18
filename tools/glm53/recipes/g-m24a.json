@@ -1,0 +1,17 @@
+{"name": "Maya-G-M24A",
+ "note": "G-M24-GPTQ with the layers the 7-way split puts on the A100s made cheap for them: A100 decode is bound by the count of K/IQ dequant steps, not by bandwidth (a 4090 clocks ~2x higher), so on blk.0-9 (GPU5), blk.70-78 (GPU6) and the output head every dense 2-D tensor goes Q8_0, which the A100 unpacks on bandwidth (~1.55 TB/s). First matching rule wins, so these run before the expert rules; routed experts (*_exps), the indexers, the routers (ffn_gate_inp / exp_probs_b / indexer.proj) and blk.10-69 keep G-M24 exactly, bytes copied from G-M24-GPTQ. attn_k_b is already Q8_0 (its 192-float row fits no K-block).",
+ "rules": [
+  {"match": "^blk\\.([0-9]|7[0-8])\\.(attn_output|attn_q_a|attn_q_b|attn_kv_a_mqa|attn_k_b|attn_v_b|ffn_(gate|up|down)_shexp)\\.weight$", "type": "Q8_0"},
+  {"match": "^blk\\.([0-9]|7[0-8])\\.ffn_(gate|up|down)\\.weight$", "type": "Q8_0"},
+  {"match": "^output\\.weight$", "type": "Q8_0"},
+  {"match": "^blk\\.78\\.ffn_(gate|up)_exps", "type": "Q3_K"},
+  {"match": "^blk\\.78\\.ffn_down_exps", "type": "Q4_K"},
+  {"match": "ffn_(gate|up)_exps", "type": "IQ2_S"},
+  {"match": "^blk\\.([3-6]|7[4-7])\\.ffn_down_exps", "type": "IQ3_S"},
+  {"match": "ffn_down_exps", "type": "IQ3_XXS"},
+  {"match": "ffn_gate_inp|exp_probs_b|indexer\\.proj", "type": "F32"},
+  {"match": "indexer\\.", "type": "Q8_0"},
+  {"match": "^blk\\.\\d+\\.attn_(output|q_a|q_b|kv_a_mqa)\\.weight$", "type": "Q4_K"},
+  {"match": "^blk\\.\\d+\\.ffn_(gate|up|down)_shexp\\.weight$", "type": "Q4_K"}
+ ],
+ "default": "Q6_K"}

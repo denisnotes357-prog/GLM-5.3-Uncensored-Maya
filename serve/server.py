@@ -1731,6 +1731,7 @@ class Service:
         starts the answer with the call's opening, thinking off; that text goes back in kwargs["_prefill"] for run()."""
         given, force = kwargs, kwargs.get("_force_tool")
         kwargs = {k: v for k, v in kwargs.items() if k != "_force_tool"}
+        dbgp = kwargs.pop("maya_prefill", None)   # debug field from chat_template_kwargs: the answer starts with it
         if force is not None and tools:
             kwargs["enable_thinking"] = False
         if self.default_effort and "reasoning_effort" not in kwargs and "enable_thinking" not in kwargs:
@@ -1740,6 +1741,9 @@ class Service:
             # GLM's form opens with the tool's name, Qwen's with <function=NAME>
             glm_calls = "<arg_key>" in self.template.source
             prefill = CALL_START + (force if glm_calls else "\n" + (f"<function={force}>\n" if force else ""))
+        elif isinstance(dbgp, str) and dbgp:
+            prefill = dbgp                        # no forced tool call: the answer continues this exact text
+        given.pop("maya_prefill", None)
         given["_prefill"] = prefill
         ids = self.render_ids(messages, tools, kwargs, prefill)
         self.embeddings.path = None
@@ -3032,6 +3036,9 @@ def make_handler(svc: Service):
             req["_api"] = "web" if req.get("strata_resume") is True else "openai"   # the Monitor's request table
             svc.check_request(req)                             # a bad sampling field or logit_bias: a 400, now
             messages, tools, kw = openai_to_messages(req)
+            _ctk = req.get("chat_template_kwargs")
+            if isinstance(_ctk, dict) and isinstance(_ctk.get("maya_prefill"), str):
+                kw["maya_prefill"] = _ctk["maya_prefill"]   # openai_to_messages forwards only its two known fields
             max_req = max_new = int(req.get("max_completion_tokens") or req.get("max_tokens") or 0)   # 0/-1: the rest
             use_mcp = req.get("strata_mcp") is True and svc.mcp is not None      # the web app's opt-in (serve/mcp.py)
             own = {t.get("name") for t in tools or []}

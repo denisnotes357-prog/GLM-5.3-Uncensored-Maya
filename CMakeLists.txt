@@ -515,6 +515,10 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   target_include_directories(glm_dsa_parity PRIVATE ${_strata_gpu_include_directories})
   target_link_libraries(glm_dsa_parity PRIVATE strata_kernels ${_strata_gpu_runtime_target})
   add_test(NAME glm_dsa_parity COMMAND glm_dsa_parity --selftest)
+  add_executable(glm_dsa_select_parity src/kernels/glm_dsa_select_parity.cpp)
+  target_include_directories(glm_dsa_select_parity PRIVATE ${_strata_gpu_include_directories})
+  target_link_libraries(glm_dsa_select_parity PRIVATE strata_kernels ${_strata_gpu_runtime_target})
+  add_test(NAME glm_dsa_select_parity COMMAND glm_dsa_select_parity --selftest)
 
   # KV streaming of the DSA latent cache (glm_kv_stream.hpp): streamed vs resident attention, bitwise (GPU, synthetic)
   add_executable(glm_kv_stream_parity src/kernels/glm_kv_stream_parity.cpp)
@@ -540,6 +544,24 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   target_link_libraries(glm_model_test PRIVATE ${_strata_gpu_glm_libs} ${_strata_gpu_runtime_target})
   add_test(NAME glm_model_test COMMAND glm_model_test --selftest)
   set_tests_properties(glm_model_test PROPERTIES WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+
+  # P1 of the port (docs/GLM53-ENGINE-PORT.md): the geometry reader on BOTH architectures - the
+  # committed Flash fixture (parse only: P1 changes no Flash bit), while the synthetic GLM-5.3
+  # (tools/glm53/make_tiny.py -> /data/glm53/tiny/tiny-f32.gguf --expect-tiny) is checked by
+  # hand in the report: that path is outside the repo.
+  add_executable(glm_dsa_geometry_test tests/glm_dsa_geometry_test.cpp)
+  target_include_directories(glm_dsa_geometry_test PRIVATE ${_strata_gpu_include_directories})
+  target_link_libraries(glm_dsa_geometry_test PRIVATE ${_strata_gpu_glm_libs} ${_strata_gpu_runtime_target})
+  add_test(NAME glm_dsa_geometry_test COMMAND glm_dsa_geometry_test
+           ${CMAKE_CURRENT_SOURCE_DIR}/data/glm5-synth.gguf --expect-flash)
+  set_tests_properties(glm_dsa_geometry_test PROPERTIES WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+
+  # P2: the glm-dsa reference step against transformers on the tiny GLM-5.3 (tools/glm53/make_tiny.py) -
+  # its fixture lives outside the repo, so this one is run by hand:
+  #   glm_dsa_model_test /data/glm53/tiny/tiny-f32.gguf /data/glm53/tiny/ref
+  add_executable(glm_dsa_model_test tests/glm_dsa_model_test.cpp)
+  target_include_directories(glm_dsa_model_test PRIVATE ${_strata_gpu_include_directories})
+  target_link_libraries(glm_dsa_model_test PRIVATE ${_strata_gpu_glm_libs} ${_strata_gpu_runtime_target})
 
   # the 45-layer big fixture: its 1.2 GB GGUF is generated into the build tree by a ctest
   # fixture (far too large to commit); the f64 expectation IS committed (data/glm5-big-dumps)
