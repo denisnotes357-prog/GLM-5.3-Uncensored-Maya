@@ -52,7 +52,7 @@ When it offers to download a model, answer **no** — it would fetch GLM-5.3-Fla
 
 ```bash
 pip install -U huggingface_hub
-hf download denisnotes357-prog/GLM-5.3-Uncensored-Maya --local-dir models/GLM-5.3-Uncensored-Maya
+hf download nofacedfl/GLM-5.3-Uncensored-Maya --local-dir models/GLM-5.3-Uncensored-Maya
 ```
 
 The download is ~270 GB: six GGUF shards and `pack/` (the engine's index of those shards plus the dense weights; it finds the shards next to itself).
@@ -98,7 +98,7 @@ The two remaining refusals are the heaviest topics (harm to children, eating dis
 
 ## Download the model
 
-**Hugging Face:** [denisnotes357-prog/GLM-5.3-Uncensored-Maya](https://huggingface.co/denisnotes357-prog/GLM-5.3-Uncensored-Maya)
+**Hugging Face:** [nofacedfl/GLM-5.3-Uncensored-Maya](https://huggingface.co/nofacedfl/GLM-5.3-Uncensored-Maya)
 
 | File | Size |
 | --- | ---: |

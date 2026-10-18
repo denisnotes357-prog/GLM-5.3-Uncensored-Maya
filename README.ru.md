@@ -36,7 +36,7 @@ git clone https://github.com/denisnotes357-prog/GLM-5.3-Uncensored-Maya
 cd GLM-5.3-Uncensored-Maya
 ./setup.sh          # как у Maya: .venv, ggml, сборка build/strata; на предложение скачать модель ответить «нет»
 pip install -U huggingface_hub
-hf download denisnotes357-prog/GLM-5.3-Uncensored-Maya --local-dir models/GLM-5.3-Uncensored-Maya
+hf download nofacedfl/GLM-5.3-Uncensored-Maya --local-dir models/GLM-5.3-Uncensored-Maya
 tools/glm53/run-glm53.sh                                       # без цензуры: донор + вектор
 tools/glm53/run-glm53.sh configs/glm53-uncensored-novector.json  # только донор
 ```

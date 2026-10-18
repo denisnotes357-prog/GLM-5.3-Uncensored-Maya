@@ -42,7 +42,7 @@ The full **GLM-5.3** (753B MoE) quantized to ~2.5 bits with GPTQ, with refusals 
 ```bash
 git clone https://github.com/denisnotes357-prog/GLM-5.3-Uncensored-Maya && cd GLM-5.3-Uncensored-Maya
 ./setup.sh                      # builds the engine (decline the Flash model download it offers)
-hf download denisnotes357-prog/GLM-5.3-Uncensored-Maya --local-dir models/GLM-5.3-Uncensored-Maya
+hf download nofacedfl/GLM-5.3-Uncensored-Maya --local-dir models/GLM-5.3-Uncensored-Maya
 tools/glm53/run-glm53.sh        # chat at http://127.0.0.1:8095, OpenAI and Anthropic APIs
 ```
 
