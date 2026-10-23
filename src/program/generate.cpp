@@ -1578,7 +1578,15 @@ static int glm_pack_generate(const Options& o) {
                 reuse = back;
             }
         }
-        if (reuse == 0) model.reset();
+        if (reuse == 0) {
+            model.reset();
+            // the snapshot no longer describes the state: a reset prompt that ends early (a client that disconnects
+            // while it is read) left snap_tokens naming the previous conversation, and that conversation's next turn
+            // restored its rings over the zeroed caches - mimo2's full-attention KV is positional and not in the
+            // snapshot - and answered with garbage from the first token (2026-10-20: an agent session after another client's cancelled request)
+            snap_tokens.clear();
+            snap_in_slot = false;
+        }
         ckpt_drop_past(reuse);   // this prompt writes the state from `reuse` on (all of it after a reset)
         std::vector<float> lg;
         t0 = std::chrono::steady_clock::now();
@@ -1839,7 +1847,10 @@ static int glm_pack_generate(const Options& o) {
             return produced < max_new;
         };
         const uint64_t spec0 = model.spec_steps_, hits0 = model.spec_hits_;
-        if (std::strcmp(finish, "cancel") != 0 && model.fast() && model.dflash_ready() && req_spec != 1) {
+        // repetition penalties need each pick's history; the drafted decodes below verify windows without it, so a
+        // request with penalties takes the token loop (slower, ~half the speed with MTP)
+        const bool pen = sp.penalty_last_n > 0;
+        if (std::strcmp(finish, "cancel") != 0 && model.fast() && model.dflash_ready() && req_spec != 1 && !pen) {
             // the DFlash decode: a block of drafts a round, one verify window checks them (same tokens as the loop
             // below for the same samples); --spec T caps a round's window at T tokens
             int64_t n_spec = 0;
@@ -1856,7 +1867,7 @@ static int glm_pack_generate(const Options& o) {
                 std::printf("ERR %s\n", err.c_str());
                 return 1;
             }
-        } else if (std::strcmp(finish, "cancel") != 0 && model.fast() && model.mtp_ready() && req_spec != 1) {
+        } else if (std::strcmp(finish, "cancel") != 0 && model.fast() && model.mtp_ready() && req_spec != 1 && !pen) {
             // the one-GPU MTP decode (glm_mtp.cu; by default on the Strix / Gorgon Halo APUs): the NextN block drafts,
             // one verify window checks the drafts (same tokens as the loop below for the same samples)
             int64_t n_spec = 0;
@@ -1877,7 +1888,8 @@ static int glm_pack_generate(const Options& o) {
                              (unsigned long long) (model.mtp_rounds_ - rounds0),
                              (double) n_spec / (double) (model.mtp_rounds_ - rounds0), lens.c_str());
             }
-        } else if (std::strcmp(finish, "cancel") != 0 && model.fast() && model.mtp_pipe_ready() && req_spec != 1) {
+        } else if (std::strcmp(finish, "cancel") != 0 && model.fast() && model.mtp_pipe_ready() && req_spec != 1 &&
+                   !pen) {
             // the pipelined MTP decode on a split (glm_mtp.cu, STRATA_GLM_MTP_PIPE=1): the NextN block on the last part
             // drafts a chain, the pipelined window checks it across the parts at once (same tokens as the loop below)
             int64_t n_spec = 0;
@@ -1890,7 +1902,7 @@ static int glm_pack_generate(const Options& o) {
             if (model.mtp_rounds_ > rounds0)
                 std::fprintf(stderr, "glm mtp pipe: %.2f tokens a drafting round\n",
                              (double) n_spec / (double) (model.mtp_rounds_ - rounds0));
-        } else if (std::strcmp(finish, "cancel") != 0 && model.fast() && model.spec_ready()) {
+        } else if (std::strcmp(finish, "cancel") != 0 && model.fast() && model.spec_ready() && !pen) {
             // the pipelined speculative decode: the two halves of the split work on consecutive tokens, the head
             // running the NextN block's draft (same tokens as the loop below)
             int64_t n_spec = 0;
@@ -1900,12 +1912,15 @@ static int glm_pack_generate(const Options& o) {
                 return 1;
             }
         } else {
+            std::vector<int32_t> pen_hist;   // the penalties' history: the prompt, then each token written
             for (;;) {
                 if (stop_req.load()) {
                     finish = "cancel";
                     break;
                 }
-                int tok = model.sample_token(sp, err);
+                if (pen && pen_hist.empty()) pen_hist = prompt;
+                int tok = pen ? model.sample_token(sp, err, pen_hist.data(), (int64_t) pen_hist.size())
+                              : model.sample_token(sp, err);
                 if (tok < 0) {
                     drop_if_poisoned(prompt, err);
                     std::printf("ERR %s\n", err.c_str());
@@ -1913,6 +1928,7 @@ static int glm_pack_generate(const Options& o) {
                 }
                 tok = model.forced(tok);
                 sp.counter += 1;
+                if (pen) pen_hist.push_back((int32_t) tok);
                 if (!on_token(tok)) break;
                 if (!model.forward({(int32_t) tok}, lg, err)) {
                     drop_if_poisoned(prompt, err);
@@ -3034,7 +3050,12 @@ static int glm_pack_generate(const Options& o) {
                         at = end + 1;
                     }
                 }
-                // penalty_* need machinery this mode does not have (history rows): ignored rather than approximated
+                // repetition penalties (llama.cpp's chain): applied through the token loop with the request's
+                // history - a request that asks for them is not drafted (see `pen` in run_request)
+                else if (k == "penalty_last_n") { rq.penalty_last_n = std::max(0, std::atoi(v.c_str())); }
+                else if (k == "penalty_repeat") { rq.penalty_repeat = (float) std::atof(v.c_str()); }
+                else if (k == "penalty_freq") { rq.penalty_freq = (float) std::atof(v.c_str()); }
+                else if (k == "penalty_present") { rq.penalty_present = (float) std::atof(v.c_str()); }
             }
             if (any_key) rq.greedy = false;   // any sampler key switches the request to the sampled path
             if (greedy_req) rq.greedy = true;
@@ -3044,7 +3065,10 @@ static int glm_pack_generate(const Options& o) {
                 std::fflush(stdout);
                 continue;
             }
-            if (!req_bias.empty() && (rq.greedy || rq.temperature <= 0.0f)) {
+            const bool req_pen = rq.penalty_last_n > 0 && (rq.penalty_repeat != 1.0f || rq.penalty_freq != 0.0f ||
+                                                            rq.penalty_present != 0.0f);
+            if (!req_pen) rq.penalty_last_n = 0;
+            if ((!req_bias.empty() || req_pen) && (rq.greedy || rq.temperature <= 0.0f)) {
                 // greedy with a bias: the sampled path's top_k = 1 is the same argmax (ties to the lower id) over the
                 // biased logits - the greedy shortcuts (the argmax at the end of a forward, the windows' argmax) read
                 // the unbiased ones

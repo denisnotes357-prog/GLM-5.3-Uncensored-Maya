@@ -31,6 +31,12 @@ Speed history of the port on that machine: 14.5 tok/s (first working build, larg
 - **Quantization toolchain** (`tools/glm53/`): FP8 calibration statistics, imatrix + GPTQ for the experts, the recipes, the donor merge (`make_gm24u.py`), the refusal-direction capture (`tools/glm53/ablate/`).
 - **Tests**: a 6-layer synthetic GLM-5.3 checked against `transformers` (`tests/glm_dsa_model_test.cpp`), slow-vs-fast path parity, the geometry loader test.
 
+## Fixes of 2026-10-20 (update if you cloned earlier)
+
+- **Agent sessions could turn into garbage.** When one client's new conversation was dropped while its prompt was being read, the engine kept the previous conversation's snapshot record although it had already reset the caches; that conversation's next turn could resume over reset state and answer with nonsense. A reset now invalidates the snapshot (found and proven on the sister MiMo-V2.6-Pro port, where the same code path broke agent sessions).
+- **Repetition penalties work.** `presence_penalty`, `frequency_penalty` and `repetition_penalty` were silently ignored on the GLM path; a request that sets them now runs through the token loop with its history (slower: no MTP drafts for that request).
+- The server removes stray thinking tags from reasoning that agents send back in the history.
+
 ## Quick start
 
 ### 1. Build the engine

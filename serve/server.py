@@ -2192,9 +2192,20 @@ def request_timings(prompt_tokens: int, generated: int, last: dict) -> dict | No
 
 
 def _debug_req(api, req, messages, tools, max_new, thinking, prompt_tokens):
-    """One compact line per request while diagnosing blank/empty turns. Set STRATA_DEBUG=1 to enable."""
+    """One compact line per request while diagnosing blank/empty turns. Set STRATA_DEBUG=1 to enable.
+    STRATA_DEBUG_DUMP=DIR also keeps each request's whole body there (req-<time>-<n>.json) to replay a bad answer."""
     if not os.environ.get("STRATA_DEBUG"):
         return
+    dump = os.environ.get("STRATA_DEBUG_DUMP")
+    if dump:
+        try:
+            _debug_req.n = getattr(_debug_req, "n", 0) + 1
+            Path(dump).mkdir(parents=True, exist_ok=True)
+            name = f"req-{time.strftime('%H%M%S')}-{_debug_req.n:05d}-{api}-{prompt_tokens}.json"
+            (Path(dump) / name).write_text(json.dumps(req, ensure_ascii=False), encoding="utf-8")
+            print(f"[maya] dump: {name}", flush=True)
+        except Exception as e:   # (diagnostics never fail a request)
+            print(f"[maya] dump failed: {e}", flush=True)
     last = messages[-1] if messages else {}
     body = last.get("content")
     if isinstance(body, list):

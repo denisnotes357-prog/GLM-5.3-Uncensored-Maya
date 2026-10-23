@@ -305,7 +305,7 @@ def openai_to_messages(req: dict) -> tuple[list[dict], list[dict] | None, dict]:
             role = "system"
         out = {"role": role, "content": _parts_of(m.get("content")) if role in ("user", "tool", "assistant") else _text_of(m.get("content"))}
         if m.get("reasoning_content"):
-            out["reasoning_content"] = m["reasoning_content"]
+            out["reasoning_content"] = clean_reasoning(m["reasoning_content"])
         if m.get("tool_calls"):
             calls = []
             for c in m["tool_calls"]:
@@ -370,7 +370,7 @@ def anthropic_to_messages(req: dict) -> tuple[list[dict], list[dict] | None, dic
         if text or calls or reasoning:
             out = {"role": m["role"], "content": "".join(text)}
             if reasoning:
-                out["reasoning_content"] = "".join(reasoning)
+                out["reasoning_content"] = clean_reasoning("".join(reasoning))
             if calls:
                 out["tool_calls"] = calls
             messages.append(out)
@@ -413,6 +413,23 @@ class Event:
 
 
 THINK_END = "</think>"
+THINK_START = "<think>"
+
+
+def clean_reasoning(text):
+    """Reasoning text without the thinking tags a model wrote into it (MiMo opens its own thinking with <think>; a
+    server that passed it on handed it back to the client, which returns it in the history: the template wraps it in
+    <think>...</think> once more and the model, seeing <think><think> in its past turns, doubles it again - in a long
+    agent session the start of each answer turned into a stack of <think> and then garbage)."""
+    if not isinstance(text, str):
+        return text
+    t = text.lstrip()
+    while t.startswith(THINK_START):
+        t = t[len(THINK_START):].lstrip()
+    t = t.rstrip()
+    while t.endswith(THINK_END):
+        t = t[:-len(THINK_END)].rstrip()
+    return t
 CALL_START = "<tool_call>"
 CALL_END = "</tool_call>"
 FUNC_START = "<function="                       # Qwen's form: <function=NAME><parameter=P>V</parameter>...</function>
@@ -500,6 +517,7 @@ class OutputParser:
 
     def __init__(self, thinking: bool = True, tools: list[dict] | None = None, stream_tools: bool = False):
         self.state = "reasoning" if thinking else "content"
+        self.head = thinking   # the reasoning's start: a <think> the model writes itself is dropped there
         self.buf = ""
         self.lead = False
         self.schemas = {t.get("name"): t for t in tools or []}
@@ -699,6 +717,14 @@ class OutputParser:
         out: list[Event] = []
         while True:
             if self.state == "reasoning":
+                if self.head:
+                    t = self.buf.lstrip()
+                    while t.startswith(THINK_START):
+                        t = t[len(THINK_START):].lstrip()
+                    if not t or THINK_START.startswith(t):   # (nothing yet, or a tag still arriving)
+                        self.buf = t
+                        return out
+                    self.buf, self.head = t, False
                 i = self.buf.find(THINK_END)
                 if i < 0:
                     keep = self._hold(self.buf, (THINK_END,))

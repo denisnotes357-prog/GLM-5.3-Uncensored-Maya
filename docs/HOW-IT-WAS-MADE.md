@@ -98,4 +98,4 @@ The stock model refused **39 of 40** JailbreakBench requests (thinking off; the 
 
 ---
 
-The engineering was done by Denis with AI coding agents (Claude Code as the main engineer, a local model for mechanical work), every engine change checked against the references above.
+The engineering was done with AI coding agents (Claude Code as the main engineer, a local model for mechanical work), every engine change checked against the references above.

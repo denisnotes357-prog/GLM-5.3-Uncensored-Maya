@@ -927,6 +927,7 @@ Glm5Model::~Glm5Model() {
         cudaSetDevice(dev_);
     }
     if (d_tok_) cudaFree(d_tok_);
+    if (d_hist_) cudaFree(d_hist_);
     if (w_arena_) cudaFree(w_arena_);
     if (mtp_arena_) cudaFree(mtp_arena_);
     kv_stream_free(kv_);
@@ -1307,7 +1308,8 @@ const float* Glm5Model::logit_bias_table(int slot, const std::vector<std::pair<i
     return tab;
 }
 
-int Glm5Model::sample_token(strata::kernels::SamplerParams& sp, std::string& err) {
+int Glm5Model::sample_token(strata::kernels::SamplerParams& sp, std::string& err, const int32_t* hist,
+                            int64_t n_hist) {
     // the fast path already ran the greedy argmax on the device at the end of the forward (an unbiased one)
     if (fast_ != nullptr && sp.greedy && sp.logit_bias == nullptr && last_tok_ >= 0) return last_tok_;
     Glm5Model* tail = this;
@@ -1316,14 +1318,36 @@ int Glm5Model::sample_token(strata::kernels::SamplerParams& sp, std::string& err
         err = "glm5_model: no sampler buffer";
         return -1;
     }
+    // the penalties' window: the last penalty_last_n tokens, one row on the sampling device (-1 pads the front)
+    int hl = 0;
+    if (hist != nullptr && n_hist > 0 && sp.penalty_last_n > 0) {
+        hl = std::min(sp.penalty_last_n, 4096);
+        cudaSetDevice(tail->dev_);
+        if (tail->d_hist_cap_ < hl) {
+            if (tail->d_hist_) cudaFree(tail->d_hist_);
+            tail->d_hist_ = nullptr;
+            tail->d_hist_cap_ = 0;
+            if (cudaMalloc(&tail->d_hist_, (size_t) hl * sizeof(int)) != cudaSuccess) {
+                cudaGetLastError();
+                err = "glm5_model: the penalties' history did not allocate";
+                cudaSetDevice(dev_);
+                return -1;
+            }
+            tail->d_hist_cap_ = hl;
+        }
+        std::vector<int32_t> row((size_t) hl, -1);
+        const int64_t take = std::min<int64_t>(hl, n_hist);
+        std::copy(hist + (n_hist - take), hist + n_hist, row.begin() + (hl - take));
+        cudaMemcpy(tail->d_hist_, row.data(), (size_t) hl * sizeof(int), cudaMemcpyHostToDevice);
+    }
     if (tail->fast_ != nullptr) {
-        const int tok = tail->fast_sample(sp, err);
+        const int tok = tail->fast_sample(sp, err, hl > 0 ? tail->d_hist_ : nullptr, hl);
         cudaSetDevice(dev_);
         return tok;
     }
     cudaSetDevice(tail->dev_);
-    strata::kernels::sample_tokens(tail->sc_ + tail->sc_logits, 1, (int) g_.n_vocab, nullptr, 0, sp,
-                                   tail->d_tok_, nullptr);
+    strata::kernels::sample_tokens(tail->sc_ + tail->sc_logits, 1, (int) g_.n_vocab, hl > 0 ? tail->d_hist_ : nullptr,
+                                   hl, sp, tail->d_tok_, nullptr);
     int tok = -1;
     if (cudaMemcpy(&tok, tail->d_tok_, sizeof(int), cudaMemcpyDeviceToHost) != cudaSuccess) {
         err = std::string("glm5_model: sampler copy: ") + cudaGetErrorString(cudaGetLastError());

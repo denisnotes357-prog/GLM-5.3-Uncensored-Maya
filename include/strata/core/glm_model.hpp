@@ -233,7 +233,10 @@ public:
     /// Runs the engine's sampler on the last forward's logits and returns the picked token id
     /// (-1 + err on failure).  Handles the device bookkeeping: with a split the logits (and the
     /// sampler buffer) live on the tail half's device, where peer reads are not available.
-    int sample_token(strata::kernels::SamplerParams& sp, std::string& err);
+    // hist / n_hist: the tokens this pick follows (the prompt and what was written), host memory - the last
+    // sp.penalty_last_n of them are the penalties' window; nullptr / 0 when the request has no penalties
+    int sample_token(strata::kernels::SamplerParams& sp, std::string& err, const int32_t* hist = nullptr,
+                     int64_t n_hist = 0);
     /// A request's logit_bias (token id, bias) as the dense n_vocab table SamplerParams::logit_bias takes, on the
     /// sampler's device (the tail half's): one table per conversation slot (0 .. seq_count()-1), rewritten for each
     /// request that names one.  nullptr for an empty list (and nullptr + err on failure).
@@ -340,6 +343,8 @@ public:
     bool defer_lane_ = false;
     std::vector<float> hop_;                               // the boundary residual staging buffer
     int* d_tok_ = nullptr;                                 // the sampler's one-int output, on dev_
+    int* d_hist_ = nullptr;                                // the penalties' history row, on dev_ (sample_token)
+    int d_hist_cap_ = 0;
     std::vector<float*> bias_tab_;                         // logit_bias_table's tables (on the tail's device)
     int bias_dev_ = -1;                                    // ... that device
     bool step_layers(int64_t p, std::string& err);
@@ -514,7 +519,7 @@ public:
     void fast_ahead_route(int il, const int* ids, unsigned int miss, const short (*ahead)[8]);   // LOOKAHEAD
     void fast_ahead_reader();
     bool fast_boundary(std::string& err);                  // between tokens: apply finished promotions
-    int fast_sample(strata::kernels::SamplerParams& sp, std::string& err);   // this half's logits, sampled on its stream
+    int fast_sample(strata::kernels::SamplerParams& sp, std::string& err, const int* d_hist = nullptr, int hist_len = 0);   // this half's logits, sampled on its stream
     int fast_sample_verify(strata::kernels::SamplerParams& sp, std::string& err);   // speculative sampling's verify
     int64_t ram_budget_ = -1;                              // bytes of pinned RAM tier for this half (-1: derive)
     float* snap_ = nullptr;                                // the saved KDA states + conv histories (this half)

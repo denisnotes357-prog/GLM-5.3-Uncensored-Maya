@@ -5426,10 +5426,11 @@ bool Glm5Model::fast_mtp(int64_t p, int32_t next_tok, std::string& err, int step
 // flight on the copy stream every sampled token - and on Windows / HIP lost the prompt after the first token (#6,
 // found by jerem91150).  The stream holds this position's forward and nothing after it (the split's tail drains
 // before it takes its next position), so the logits read are the ones just computed.
-int Glm5Model::fast_sample(strata::kernels::SamplerParams& sp, std::string& err) {
+int Glm5Model::fast_sample(strata::kernels::SamplerParams& sp, std::string& err, const int* d_hist, int hist_len) {
     FastState* F = fast_;
     cudaSetDevice(dev_);
-    strata::kernels::sample_tokens(sc_ + sc_logits, 1, (int) g_.n_vocab, nullptr, 0, sp, d_tok_, F->cs);
+    strata::kernels::sample_tokens(sc_ + sc_logits, 1, (int) g_.n_vocab, d_hist, d_hist ? hist_len : 0, sp, d_tok_,
+                                   F->cs);
     cudaMemcpyAsync(F->tok_h, d_tok_, sizeof(int), cudaMemcpyDeviceToHost, F->cs);
     if (!glmfast::cuda_ok(cudaStreamSynchronize(F->cs), "glm sampler", err) || !F->route_ok(err)) return -1;
     return F->tok_h[0];
