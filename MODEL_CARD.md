@@ -73,6 +73,10 @@ Full story, numbers and dead ends: [HOW-IT-WAS-MADE.md](https://github.com/denis
 | Chat at temperature 1.0 | 43–44 |
 | 1M context | ~30 |
 
+## Engine fixes (2026-10-20)
+
+The engine on GitHub now invalidates a conversation snapshot when another conversation resets the state (a dropped request could otherwise leave long agent sessions answering garbage) and applies repetition penalties on the GLM path. Update the engine if you cloned before 2026-10-20.
+
 ## Responsible use
 
 This model answers requests the original refuses. It is published for research, red-teaming, private and creative use
